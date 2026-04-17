@@ -1,6 +1,49 @@
 <policies>
     <inbound>
         <base />
+        <choose>
+            <when condition='@(!context.Request.Headers.ContainsKey("x-test-run-id"))'>
+                <llm-token-limit counter-key='@(context.Subscription != null ? context.Subscription.Id : context.Request.IpAddress)'
+                    tokens-per-minute="45" estimate-prompt-tokens="true" remaining-tokens-variable-name="remainingTokens" />
+            </when>
+        </choose>
+        <choose>
+            <when condition='@(context.Request.Headers.ContainsKey("x-test-run-id"))'>
+                <rate-limit-by-key calls="100" renewal-period="60"
+                    counter-key='@("test-run:" + context.Request.Headers.GetValueOrDefault("x-test-run-id", "na"))' />
+            </when>
+        </choose>
+        <set-variable name="estimatedPromptTokens" value='@{
+            var body = context.Request.Body?.As<JObject>(preserveContent: true);
+            var messages = body?["messages"] as JArray;
+            if (messages == null)
+            {
+                return 0;
+            }
+            var text = "";
+            foreach (var m in messages)
+            {
+                text += (string)m["content"] + " ";
+            }
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return 0;
+            }
+            return (int)Math.Ceiling(text.Length / 4.0);
+        }' />
+        <emit-metric name="prompt-tokens-estimated"
+            value='@((double)context.Variables.GetValueOrDefault<int>("estimatedPromptTokens", 0))'
+            namespace="llm-fallback">
+            <dimension name="Subscription ID" value='@(context.Subscription != null ? context.Subscription.Id : "N/A")' />
+            <dimension name="API ID" value="@(context.Api.Id)" />
+            <dimension name="Operation ID" value="@(context.Operation.Id)" />
+        </emit-metric>
+        <llm-emit-token-metric namespace="llm">
+            <dimension name="Subscription ID" value='@(context.Subscription != null ? context.Subscription.Id : "N/A")' />
+            <dimension name="Client IP" value="@(context.Request.IpAddress)" />
+            <dimension name="API ID" value="@(context.Api.Id)" />
+            <dimension name="User ID" value='@(context.Request.Headers.GetValueOrDefault("x-user-id", "N/A"))' />
+        </llm-emit-token-metric>
     </inbound>
     <backend>
         <base />

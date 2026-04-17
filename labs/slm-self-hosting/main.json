@@ -1,0 +1,656 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "languageVersion": "2.0",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.41.2.15936",
+      "templateHash": "7035371649907596719"
+    }
+  },
+  "parameters": {
+    "apimSku": {
+      "type": "string"
+    },
+    "openAIAPIVersion": {
+      "type": "string",
+      "defaultValue": "2024-02-01"
+    },
+    "selfHostedGatewayName": {
+      "type": "string",
+      "defaultValue": "self-hosted-gateway"
+    },
+    "deploySelfHostedGateway": {
+      "type": "bool",
+      "defaultValue": true
+    }
+  },
+  "variables": {
+    "$fxv#0": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <choose>\r\n            <when condition='@(!context.Request.Headers.ContainsKey(\"x-test-run-id\"))'>\r\n                <llm-token-limit counter-key='@(context.Subscription != null ? context.Subscription.Id : context.Request.IpAddress)'\r\n                    tokens-per-minute=\"45\" estimate-prompt-tokens=\"true\" remaining-tokens-variable-name=\"remainingTokens\" />\r\n            </when>\r\n        </choose>\r\n        <choose>\r\n            <when condition='@(context.Request.Headers.ContainsKey(\"x-test-run-id\"))'>\r\n                <rate-limit-by-key calls=\"100\" renewal-period=\"60\"\r\n                    counter-key='@(\"test-run:\" + context.Request.Headers.GetValueOrDefault(\"x-test-run-id\", \"na\"))' />\r\n            </when>\r\n        </choose>\r\n        <set-variable name=\"estimatedPromptTokens\" value='@{\r\n            var body = context.Request.Body?.As<JObject>(preserveContent: true);\r\n            var messages = body?[\"messages\"] as JArray;\r\n            if (messages == null)\r\n            {\r\n                return 0;\r\n            }\r\n            var text = \"\";\r\n            foreach (var m in messages)\r\n            {\r\n                text += (string)m[\"content\"] + \" \";\r\n            }\r\n            if (string.IsNullOrWhiteSpace(text))\r\n            {\r\n                return 0;\r\n            }\r\n            return (int)Math.Ceiling(text.Length / 4.0);\r\n        }' />\r\n        <emit-metric name=\"prompt-tokens-estimated\"\r\n            value='@((double)context.Variables.GetValueOrDefault<int>(\"estimatedPromptTokens\", 0))'\r\n            namespace=\"llm-fallback\">\r\n            <dimension name=\"Subscription ID\" value='@(context.Subscription != null ? context.Subscription.Id : \"N/A\")' />\r\n            <dimension name=\"API ID\" value=\"@(context.Api.Id)\" />\r\n            <dimension name=\"Operation ID\" value=\"@(context.Operation.Id)\" />\r\n        </emit-metric>\r\n        <llm-emit-token-metric namespace=\"llm\">\r\n            <dimension name=\"Subscription ID\" value='@(context.Subscription != null ? context.Subscription.Id : \"N/A\")' />\r\n            <dimension name=\"Client IP\" value=\"@(context.Request.IpAddress)\" />\r\n            <dimension name=\"API ID\" value=\"@(context.Api.Id)\" />\r\n            <dimension name=\"User ID\" value='@(context.Request.Headers.GetValueOrDefault(\"x-user-id\", \"N/A\"))' />\r\n        </llm-emit-token-metric>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
+    "resourceSuffix": "[uniqueString(subscription().id, resourceGroup().id)]",
+    "apiManagementName": "[format('apim-{0}', variables('resourceSuffix'))]",
+    "apimSubscriptionName": "apim-subscription",
+    "apimSubscriptionDescription": "APIM Subscription",
+    "openAIAPIName": "openai",
+    "policyXml": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <choose>\r\n            <when condition='@(!context.Request.Headers.ContainsKey(\"x-test-run-id\"))'>\r\n                <llm-token-limit counter-key='@(context.Subscription != null ? context.Subscription.Id : context.Request.IpAddress)'\r\n                    tokens-per-minute=\"45\" estimate-prompt-tokens=\"true\" remaining-tokens-variable-name=\"remainingTokens\" />\r\n            </when>\r\n        </choose>\r\n        <choose>\r\n            <when condition='@(context.Request.Headers.ContainsKey(\"x-test-run-id\"))'>\r\n                <rate-limit-by-key calls=\"100\" renewal-period=\"60\"\r\n                    counter-key='@(\"test-run:\" + context.Request.Headers.GetValueOrDefault(\"x-test-run-id\", \"na\"))' />\r\n            </when>\r\n        </choose>\r\n        <set-variable name=\"estimatedPromptTokens\" value='@{\r\n            var body = context.Request.Body?.As<JObject>(preserveContent: true);\r\n            var messages = body?[\"messages\"] as JArray;\r\n            if (messages == null)\r\n            {\r\n                return 0;\r\n            }\r\n            var text = \"\";\r\n            foreach (var m in messages)\r\n            {\r\n                text += (string)m[\"content\"] + \" \";\r\n            }\r\n            if (string.IsNullOrWhiteSpace(text))\r\n            {\r\n                return 0;\r\n            }\r\n            return (int)Math.Ceiling(text.Length / 4.0);\r\n        }' />\r\n        <emit-metric name=\"prompt-tokens-estimated\"\r\n            value='@((double)context.Variables.GetValueOrDefault<int>(\"estimatedPromptTokens\", 0))'\r\n            namespace=\"llm-fallback\">\r\n            <dimension name=\"Subscription ID\" value='@(context.Subscription != null ? context.Subscription.Id : \"N/A\")' />\r\n            <dimension name=\"API ID\" value=\"@(context.Api.Id)\" />\r\n            <dimension name=\"Operation ID\" value=\"@(context.Operation.Id)\" />\r\n        </emit-metric>\r\n        <llm-emit-token-metric namespace=\"llm\">\r\n            <dimension name=\"Subscription ID\" value='@(context.Subscription != null ? context.Subscription.Id : \"N/A\")' />\r\n            <dimension name=\"Client IP\" value=\"@(context.Request.IpAddress)\" />\r\n            <dimension name=\"API ID\" value=\"@(context.Api.Id)\" />\r\n            <dimension name=\"User ID\" value='@(context.Request.Headers.GetValueOrDefault(\"x-user-id\", \"N/A\"))' />\r\n        </llm-emit-token-metric>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n"
+  },
+  "resources": {
+    "apim": {
+      "existing": true,
+      "type": "Microsoft.ApiManagement/service",
+      "apiVersion": "2024-06-01-preview",
+      "name": "[variables('apiManagementName')]",
+      "dependsOn": [
+        "apimModule"
+      ]
+    },
+    "apimDiagnosticSettings": {
+      "type": "Microsoft.Insights/diagnosticSettings",
+      "apiVersion": "2021-05-01-preview",
+      "scope": "[resourceId('Microsoft.ApiManagement/service', variables('apiManagementName'))]",
+      "name": "apimDiagnosticSettings",
+      "properties": {
+        "workspaceId": "[reference('lawModule').outputs.id.value]",
+        "logAnalyticsDestinationType": "Dedicated",
+        "logs": [
+          {
+            "categoryGroup": "AllLogs",
+            "enabled": true
+          }
+        ],
+        "metrics": [
+          {
+            "category": "AllMetrics",
+            "enabled": true
+          }
+        ]
+      },
+      "dependsOn": [
+        "apimModule",
+        "lawModule"
+      ]
+    },
+    "apimLogger": {
+      "type": "Microsoft.ApiManagement/service/loggers",
+      "apiVersion": "2024-06-01-preview",
+      "name": "[format('{0}/{1}', variables('apiManagementName'), 'azuremonitor')]",
+      "properties": {
+        "loggerType": "azureMonitor",
+        "isBuffered": false
+      },
+      "dependsOn": [
+        "apimModule"
+      ]
+    },
+    "apimSubscription": {
+      "type": "Microsoft.ApiManagement/service/subscriptions",
+      "apiVersion": "2024-06-01-preview",
+      "name": "[format('{0}/{1}', variables('apiManagementName'), variables('apimSubscriptionName'))]",
+      "properties": {
+        "allowTracing": true,
+        "displayName": "[variables('apimSubscriptionDescription')]",
+        "scope": "/apis",
+        "state": "active"
+      },
+      "dependsOn": [
+        "apimModule"
+      ]
+    },
+    "api": {
+      "type": "Microsoft.ApiManagement/service/apis",
+      "apiVersion": "2023-05-01-preview",
+      "name": "[format('{0}/{1}', variables('apiManagementName'), 'ai-model-inference')]",
+      "properties": {
+        "apiType": "http",
+        "description": "AI Model Inference",
+        "displayName": "AI Model Inference",
+        "format": "openapi-link",
+        "path": "inference",
+        "serviceUrl": "http://host.docker.internal:59643/v1",
+        "protocols": [
+          "https",
+          "http"
+        ],
+        "subscriptionKeyParameterNames": {
+          "header": "api-key",
+          "query": "api-key"
+        },
+        "subscriptionRequired": true,
+        "type": "http",
+        "value": "https://raw.githubusercontent.com/Azure/azure-rest-api-specs/refs/heads/main/specification/ai/data-plane/ModelInference/openapi/2024-05-01-preview/openapi.yaml"
+      },
+      "dependsOn": [
+        "apimModule"
+      ]
+    },
+    "apiPolicy": {
+      "type": "Microsoft.ApiManagement/service/apis/policies",
+      "apiVersion": "2021-12-01-preview",
+      "name": "[format('{0}/{1}/{2}', variables('apiManagementName'), 'ai-model-inference', 'policy')]",
+      "properties": {
+        "format": "rawxml",
+        "value": "[variables('$fxv#0')]"
+      },
+      "dependsOn": [
+        "api"
+      ]
+    },
+    "apiDiagnosticsAppInsights": {
+      "type": "Microsoft.ApiManagement/service/apis/diagnostics",
+      "apiVersion": "2022-08-01",
+      "name": "[format('{0}/{1}/{2}', variables('apiManagementName'), 'ai-model-inference', 'applicationinsights')]",
+      "properties": {
+        "alwaysLog": "allErrors",
+        "httpCorrelationProtocol": "W3C",
+        "logClientIp": true,
+        "loggerId": "[resourceId(resourceGroup().name, 'Microsoft.ApiManagement/service/loggers', variables('apiManagementName'), 'apim-logger')]",
+        "metrics": true,
+        "verbosity": "verbose",
+        "sampling": {
+          "samplingType": "fixed",
+          "percentage": 100
+        }
+      },
+      "dependsOn": [
+        "api",
+        "apimModule"
+      ]
+    },
+    "selfHostedGateway": {
+      "condition": "[parameters('deploySelfHostedGateway')]",
+      "type": "Microsoft.ApiManagement/service/gateways",
+      "apiVersion": "2021-08-01",
+      "name": "[format('{0}/{1}', variables('apiManagementName'), parameters('selfHostedGatewayName'))]",
+      "properties": {
+        "description": "Self-hosted gateway",
+        "locationData": {
+          "name": "Lisbon",
+          "countryOrRegion": "Portugal"
+        }
+      },
+      "dependsOn": [
+        "apimModule"
+      ]
+    },
+    "gatewayAPIResource": {
+      "condition": "[parameters('deploySelfHostedGateway')]",
+      "type": "Microsoft.ApiManagement/service/gateways/apis",
+      "apiVersion": "2021-08-01",
+      "name": "[format('{0}/{1}/{2}', variables('apiManagementName'), parameters('selfHostedGatewayName'), 'ai-model-inference')]",
+      "properties": {},
+      "dependsOn": [
+        "api",
+        "apimModule"
+      ]
+    },
+    "lawModule": {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "lawModule",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.41.2.15936",
+              "templateHash": "5180125224498115037"
+            }
+          },
+          "parameters": {
+            "resourceSuffix": {
+              "type": "string",
+              "defaultValue": "[uniqueString(subscription().id, resourceGroup().id)]",
+              "metadata": {
+                "description": "The suffix to append to the Log Analytics name. Defaults to a unique string based on subscription and resource group IDs."
+              }
+            },
+            "logAnalyticsName": {
+              "type": "string",
+              "defaultValue": "[format('workspace-{0}', parameters('resourceSuffix'))]",
+              "metadata": {
+                "description": "Name of the Log Analytics resource. Defaults to \"workspace-<resourceSuffix>\"."
+              }
+            },
+            "logAnalyticsLocation": {
+              "type": "string",
+              "defaultValue": "[resourceGroup().location]",
+              "metadata": {
+                "description": "Location of the Log Analytics resource"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.OperationalInsights/workspaces",
+              "apiVersion": "2023-09-01",
+              "name": "[parameters('logAnalyticsName')]",
+              "location": "[parameters('logAnalyticsLocation')]",
+              "properties": {
+                "retentionInDays": 30,
+                "features": {
+                  "searchVersion": 1
+                },
+                "sku": {
+                  "name": "PerGB2018"
+                }
+              },
+              "identity": {
+                "type": "SystemAssigned"
+              }
+            }
+          ],
+          "outputs": {
+            "id": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('logAnalyticsName'))]"
+            },
+            "name": {
+              "type": "string",
+              "value": "[parameters('logAnalyticsName')]"
+            },
+            "customerId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', parameters('logAnalyticsName')), '2023-09-01').customerId]"
+            },
+            "primarySharedKey": {
+              "type": "string",
+              "value": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', parameters('logAnalyticsName')), '2023-09-01').primarySharedKey]"
+            }
+          }
+        }
+      }
+    },
+    "appInsightsModule": {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "appInsightsModule",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "lawId": {
+            "value": "[reference('lawModule').outputs.id.value]"
+          },
+          "customMetricsOptedInType": {
+            "value": "WithDimensions"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.41.2.15936",
+              "templateHash": "10491672764174057596"
+            }
+          },
+          "parameters": {
+            "resourceSuffix": {
+              "type": "string",
+              "defaultValue": "[uniqueString(subscription().id, resourceGroup().id)]",
+              "metadata": {
+                "description": "The suffix to append to the Application Insights name. Defaults to a unique string based on subscription and resource group IDs."
+              }
+            },
+            "applicationInsightsName": {
+              "type": "string",
+              "defaultValue": "[format('insights-{0}', parameters('resourceSuffix'))]",
+              "metadata": {
+                "description": "Name of the Application Insights resource. Defaults to \"insights-<resourceSuffix>\"."
+              }
+            },
+            "applicationInsightsLocation": {
+              "type": "string",
+              "defaultValue": "[resourceGroup().location]",
+              "metadata": {
+                "description": "Location of the Application Insights resource"
+              }
+            },
+            "customMetricsOptedInType": {
+              "type": "string",
+              "defaultValue": "Off",
+              "allowedValues": [
+                "WithDimensions",
+                "NoDimensions",
+                "NoMeasurements",
+                "Off"
+              ],
+              "metadata": {
+                "description": "The custom metrics opted in type. Default is Off"
+              }
+            },
+            "useWorkbook": {
+              "type": "bool",
+              "defaultValue": false,
+              "metadata": {
+                "description": "Indicate whether workbook is used. Default is false"
+              }
+            },
+            "workbookName": {
+              "type": "string",
+              "defaultValue": "UsageAnalysis",
+              "metadata": {
+                "description": "Name for the Workbook. Defaults to \"UsageAnalysis\"."
+              }
+            },
+            "workbookLocation": {
+              "type": "string",
+              "defaultValue": "[resourceGroup().location]",
+              "metadata": {
+                "description": "Location for the Workbook"
+              }
+            },
+            "workbookDisplayName": {
+              "type": "string",
+              "defaultValue": "Usage Analysis",
+              "metadata": {
+                "description": "Display Name for the Workbook. Defaults to \"Usage Analysis\"."
+              }
+            },
+            "workbookJson": {
+              "type": "string",
+              "defaultValue": "",
+              "metadata": {
+                "description": "JSON string for the Workbook"
+              }
+            },
+            "lawId": {
+              "type": "string",
+              "metadata": {
+                "description": "Log Analytics Workspace Id"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Insights/components",
+              "apiVersion": "2020-02-02",
+              "name": "[parameters('applicationInsightsName')]",
+              "location": "[parameters('applicationInsightsLocation')]",
+              "kind": "web",
+              "properties": {
+                "Application_Type": "web",
+                "WorkspaceResourceId": "[parameters('lawId')]",
+                "CustomMetricsOptedInType": "[parameters('customMetricsOptedInType')]"
+              }
+            },
+            {
+              "condition": "[parameters('useWorkbook')]",
+              "type": "Microsoft.Insights/workbooks",
+              "apiVersion": "2022-04-01",
+              "name": "[guid(resourceGroup().id, parameters('workbookName'))]",
+              "location": "[parameters('workbookLocation')]",
+              "kind": "shared",
+              "properties": {
+                "displayName": "[parameters('workbookDisplayName')]",
+                "serializedData": "[parameters('workbookJson')]",
+                "sourceId": "[resourceId('Microsoft.Insights/components', parameters('applicationInsightsName'))]",
+                "category": "UsageAnalysis"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Insights/components', parameters('applicationInsightsName'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "id": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Insights/components', parameters('applicationInsightsName'))]"
+            },
+            "name": {
+              "type": "string",
+              "value": "[parameters('applicationInsightsName')]"
+            },
+            "instrumentationKey": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Insights/components', parameters('applicationInsightsName')), '2020-02-02').InstrumentationKey]"
+            },
+            "appId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Insights/components', parameters('applicationInsightsName')), '2020-02-02').AppId]"
+            },
+            "applicationInsightsName": {
+              "type": "string",
+              "value": "[parameters('applicationInsightsName')]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "lawModule"
+      ]
+    },
+    "apimModule": {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "apimModule",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "apimSku": {
+            "value": "[parameters('apimSku')]"
+          },
+          "appInsightsInstrumentationKey": {
+            "value": "[reference('appInsightsModule').outputs.instrumentationKey.value]"
+          },
+          "appInsightsId": {
+            "value": "[reference('appInsightsModule').outputs.id.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.41.2.15936",
+              "templateHash": "16174711045463543989"
+            }
+          },
+          "parameters": {
+            "resourceSuffix": {
+              "type": "string",
+              "defaultValue": "[uniqueString(subscription().id, resourceGroup().id)]",
+              "metadata": {
+                "description": "The suffix to append to the API Management instance name. Defaults to a unique string based on subscription and resource group IDs."
+              }
+            },
+            "apiManagementName": {
+              "type": "string",
+              "defaultValue": "[format('apim-{0}', parameters('resourceSuffix'))]",
+              "metadata": {
+                "description": "The name of the API Management instance. Defaults to \"apim-<resourceSuffix>\"."
+              }
+            },
+            "location": {
+              "type": "string",
+              "defaultValue": "[resourceGroup().location]",
+              "metadata": {
+                "description": "The location of the API Management instance. Defaults to the resource group location."
+              }
+            },
+            "publisherEmail": {
+              "type": "string",
+              "defaultValue": "noreply@microsoft.com",
+              "metadata": {
+                "description": "The email address of the publisher. Defaults to \"noreply@microsoft.com\"."
+              }
+            },
+            "publisherName": {
+              "type": "string",
+              "defaultValue": "Microsoft",
+              "metadata": {
+                "description": "The name of the publisher. Defaults to \"Microsoft\"."
+              }
+            },
+            "apimLoggerName": {
+              "type": "string",
+              "defaultValue": "apim-logger",
+              "metadata": {
+                "description": "Name of the APIM Logger"
+              }
+            },
+            "apimLoggerDescription": {
+              "type": "string",
+              "defaultValue": "APIM Logger for OpenAI API",
+              "metadata": {
+                "description": "Description of the APIM Logger"
+              }
+            },
+            "apimSku": {
+              "type": "string",
+              "defaultValue": "Basicv2",
+              "allowedValues": [
+                "Consumption",
+                "Developer",
+                "Basic",
+                "Basicv2",
+                "Standard",
+                "Standardv2",
+                "Premium"
+              ],
+              "metadata": {
+                "description": "The pricing tier of this API Management service"
+              }
+            },
+            "appInsightsInstrumentationKey": {
+              "type": "string",
+              "defaultValue": "",
+              "metadata": {
+                "description": "The instrumentation key for Application Insights"
+              }
+            },
+            "appInsightsId": {
+              "type": "string",
+              "defaultValue": "",
+              "metadata": {
+                "description": "The resource ID for Application Insights"
+              }
+            },
+            "apimManagedIdentityType": {
+              "type": "string",
+              "defaultValue": "SystemAssigned",
+              "allowedValues": [
+                "SystemAssigned",
+                "UserAssigned",
+                "SystemAssigned, UserAssigned"
+              ],
+              "metadata": {
+                "description": "The type of managed identity to by used with API Management"
+              }
+            },
+            "apimUserAssignedManagedIdentityId": {
+              "type": "string",
+              "defaultValue": "",
+              "metadata": {
+                "description": "The user-assigned managed identity ID to be used with API Management"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.ApiManagement/service",
+              "apiVersion": "2024-06-01-preview",
+              "name": "[parameters('apiManagementName')]",
+              "location": "[parameters('location')]",
+              "sku": {
+                "name": "[parameters('apimSku')]",
+                "capacity": 1
+              },
+              "properties": {
+                "publisherEmail": "[parameters('publisherEmail')]",
+                "publisherName": "[parameters('publisherName')]"
+              },
+              "identity": {
+                "type": "[parameters('apimManagedIdentityType')]",
+                "userAssignedIdentities": "[if(and(equals(parameters('apimManagedIdentityType'), 'UserAssigned'), not(equals(parameters('apimUserAssignedManagedIdentityId'), ''))), createObject(format('{0}', parameters('apimUserAssignedManagedIdentityId')), createObject()), null())]"
+              }
+            },
+            {
+              "condition": "[and(not(empty(parameters('appInsightsId'))), not(empty(parameters('appInsightsInstrumentationKey'))))]",
+              "type": "Microsoft.ApiManagement/service/loggers",
+              "apiVersion": "2021-12-01-preview",
+              "name": "[format('{0}/{1}', parameters('apiManagementName'), parameters('apimLoggerName'))]",
+              "properties": {
+                "credentials": {
+                  "instrumentationKey": "[parameters('appInsightsInstrumentationKey')]"
+                },
+                "description": "[parameters('apimLoggerDescription')]",
+                "isBuffered": false,
+                "loggerType": "applicationInsights",
+                "resourceId": "[parameters('appInsightsId')]"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.ApiManagement/service', parameters('apiManagementName'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "id": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.ApiManagement/service', parameters('apiManagementName'))]"
+            },
+            "name": {
+              "type": "string",
+              "value": "[parameters('apiManagementName')]"
+            },
+            "principalId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.ApiManagement/service', parameters('apiManagementName')), '2024-06-01-preview', 'full').identity.principalId]"
+            },
+            "gatewayUrl": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.ApiManagement/service', parameters('apiManagementName')), '2024-06-01-preview').gatewayUrl]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "appInsightsModule"
+      ]
+    }
+  },
+  "outputs": {
+    "applicationInsightsAppId": {
+      "type": "string",
+      "value": "[reference('appInsightsModule').outputs.appId.value]"
+    },
+    "applicationInsightsName": {
+      "type": "string",
+      "value": "[reference('appInsightsModule').outputs.applicationInsightsName.value]"
+    },
+    "logAnalyticsWorkspaceId": {
+      "type": "string",
+      "value": "[reference('lawModule').outputs.customerId.value]"
+    },
+    "apimResourceGatewayURL": {
+      "type": "string",
+      "value": "[reference('apimModule').outputs.gatewayUrl.value]"
+    },
+    "apimResourceId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.ApiManagement/service', variables('apiManagementName'))]"
+    },
+    "apimResourceName": {
+      "type": "string",
+      "value": "[variables('apiManagementName')]"
+    },
+    "apimSubscriptionKey": {
+      "type": "string",
+      "value": "[listSecrets('apimSubscription', '2024-06-01-preview').primaryKey]"
+    }
+  }
+}

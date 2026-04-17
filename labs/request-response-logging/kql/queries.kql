@@ -1,0 +1,114 @@
+// =============================================================================
+//  KQL Queries for AI Gateway Request/Response Logging (BasicV2 SKU)
+// =============================================================================
+//  Workspace: log-aigw-5e3hqtbguevmo  (id: 29f2f3ee-dbaa-4a26-af3f-2cdb2b1cad75)
+//  App Insights: appi-aigw-5e3hqtbguevmo
+// =============================================================================
+
+
+// -----------------------------------------------------------------------------
+//  ⭐ 1. 每筆請求的 Input / Output / Tokens (主要查詢)
+// -----------------------------------------------------------------------------
+AppDependencies
+| where TimeGenerated > ago(1h)
+| where Name startswith "POST /" and (Name has "chat/completions" or Name has "responses" or Name has "threads" or Name has "assistants")
+| extend P = parse_json(tostring(Properties))
+| extend RequestBody  = tostring(P["Request-Body"]),
+         ResponseBody = tostring(P["Response-Body"]),
+         Usage        = parse_json(tostring(P["Response-Body"])).usage
+| project TimeGenerated,
+          Endpoint      = Name,
+          Backend       = Target,
+          Status        = ResultCode,
+          DurationMs,
+          RequestBody,
+          ResponseBody,
+          PromptTokens     = toint(Usage.prompt_tokens),
+          CompletionTokens = toint(Usage.completion_tokens),
+          TotalTokens      = toint(Usage.total_tokens)
+| order by TimeGenerated desc
+
+
+// -----------------------------------------------------------------------------
+//  2. Custom Trace Policy Events (含 correlationId / clientIp / subscription)
+// -----------------------------------------------------------------------------
+AppTraces
+| where TimeGenerated > ago(1h)
+| where Message startswith "LLM "
+| extend P = parse_json(tostring(Properties))
+| project TimeGenerated,
+          Message,
+          CorrelationId  = tostring(P.correlationId),
+          ApiId          = tostring(P.apiId),
+          OperationId    = tostring(P.operationId),
+          SubscriptionId = tostring(P.subscriptionId),
+          ClientIp       = tostring(P.clientIp),
+          StatusCode     = tostring(P.statusCode)
+| order by TimeGenerated desc
+
+
+// -----------------------------------------------------------------------------
+//  3. 以 correlationId 串起 Request + Response (端到端)
+// -----------------------------------------------------------------------------
+let corrId = "<paste-correlationId-here>";
+AppTraces
+| where Properties has corrId
+| project TimeGenerated, Message, Properties
+
+
+// -----------------------------------------------------------------------------
+//  4. Token 使用量統計 (每小時)
+// -----------------------------------------------------------------------------
+AppDependencies
+| where TimeGenerated > ago(24h)
+| where Name has "chat/completions" and ResultCode == "200"
+| extend Usage = parse_json(tostring(parse_json(tostring(Properties))["Response-Body"])).usage
+| summarize Calls = count(),
+            PromptTokens     = sum(toint(Usage.prompt_tokens)),
+            CompletionTokens = sum(toint(Usage.completion_tokens)),
+            TotalTokens      = sum(toint(Usage.total_tokens))
+        by bin(TimeGenerated, 1h)
+| order by TimeGenerated desc
+
+
+// -----------------------------------------------------------------------------
+//  5. Streaming vs Non-Streaming
+// -----------------------------------------------------------------------------
+AppDependencies
+| where TimeGenerated > ago(1h)
+| where Name has "chat/completions"
+| extend ReqBody = tostring(parse_json(tostring(Properties))["Request-Body"])
+| extend IsStream = ReqBody has "\"stream\":true"
+| summarize Count = count() by IsStream, ResultCode
+
+
+// -----------------------------------------------------------------------------
+//  6. 各客戶端 (Client IP) 使用量
+// -----------------------------------------------------------------------------
+AppTraces
+| where TimeGenerated > ago(24h)
+| where Message startswith "LLM Request"
+| extend ClientIp = tostring(parse_json(tostring(Properties)).clientIp)
+| summarize Requests = count() by ClientIp
+| order by Requests desc
+
+
+// -----------------------------------------------------------------------------
+//  7. 錯誤分析 (4xx / 5xx)
+// -----------------------------------------------------------------------------
+AppDependencies
+| where TimeGenerated > ago(1h)
+| where toint(ResultCode) >= 400
+| extend ResponseBody = tostring(parse_json(tostring(Properties))["Response-Body"])
+| project TimeGenerated, Name, ResultCode, DurationMs, Target, ResponseBody
+| order by TimeGenerated desc
+
+
+// -----------------------------------------------------------------------------
+//  8. 前端請求總覽 (含 APIM 內部處理時間)
+// -----------------------------------------------------------------------------
+AppRequests
+| where TimeGenerated > ago(1h)
+| where Name startswith "POST /kunlenewfoundry01"
+| project TimeGenerated, Name, Url, ResultCode, DurationMs, Success, ClientIP
+| order by TimeGenerated desc

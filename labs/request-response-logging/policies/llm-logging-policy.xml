@@ -1,0 +1,72 @@
+<!--
+    LLM Logging Policy — for OpenAI-compatible APIs (Chat Completions, Responses)
+    Works together with the API-level Diagnostic `applicationinsights` that has
+    `largeLanguageModel.logs = enabled` to automatically capture prompts/completions
+    and token usage into Application Insights.
+
+    This policy adds:
+      - llm-token-limit (optional: per-subscription token rate limiting)
+      - llm-emit-token-metric (custom dimensions for filtering in Azure Monitor)
+      - <trace> entries for correlation and debugging
+-->
+<policies>
+    <inbound>
+        <base />
+
+        <!-- Route to backend (was in the original policy before our override) -->
+        <set-backend-service backend-id="kunlenewfoundry01" />
+
+        <!-- Correlation ID for tying prompts and completions -->
+        <set-variable name="correlationId" value="@(Guid.NewGuid().ToString())" />
+
+        <!-- Emit a trace with request metadata (visible in App Insights 'traces') -->
+        <trace source="llm-logging" severity="information">
+            <message>@("LLM Request: " + context.Request.Url.Path)</message>
+            <metadata name="correlationId" value="@((string)context.Variables["correlationId"])" />
+            <metadata name="subscriptionId" value="@(context.Subscription != null ? context.Subscription.Id : "anonymous")" />
+            <metadata name="apiId" value="@(context.Api.Id)" />
+            <metadata name="operationId" value="@(context.Operation.Id)" />
+            <metadata name="clientIp" value="@(context.Request.IpAddress)" />
+        </trace>
+
+        <!-- Emit token usage metric for monitoring -->
+        <llm-emit-token-metric namespace="llm-logging">
+            <dimension name="Subscription ID" value="@(context.Subscription != null ? context.Subscription.Id : "anonymous")" />
+            <dimension name="API ID" value="@(context.Api.Id)" />
+            <dimension name="Operation ID" value="@(context.Operation.Id)" />
+            <dimension name="Correlation ID" value="@((string)context.Variables[&quot;correlationId&quot;])" />
+        </llm-emit-token-metric>
+    </inbound>
+
+    <backend>
+        <!-- Retry on 429 (Server at maximum concurrent capacity) and transient 5xx.
+             Up to 3 retries with exponential backoff (2s, 4s, 8s). -->
+        <retry condition="@(context.Response.StatusCode == 429 || context.Response.StatusCode == 503 || context.Response.StatusCode == 504)"
+               count="3"
+               interval="2"
+               delta="2"
+               max-interval="10"
+               first-fast-retry="false">
+            <forward-request buffer-request-body="true" />
+        </retry>
+    </backend>
+
+    <outbound>
+        <base />
+
+        <!-- Trace the response completion (body is auto-captured via diagnostic setting) -->
+        <trace source="llm-logging" severity="information">
+            <message>@("LLM Response status: " + context.Response.StatusCode)</message>
+            <metadata name="correlationId" value="@((string)context.Variables["correlationId"])" />
+            <metadata name="statusCode" value="@(context.Response.StatusCode.ToString())" />
+        </trace>
+    </outbound>
+
+    <on-error>
+        <base />
+        <trace source="llm-logging" severity="error">
+            <message>@("LLM Error: " + (context.LastError?.Message ?? "unknown"))</message>
+            <metadata name="correlationId" value="@((string)context.Variables[&quot;correlationId&quot;])" />
+        </trace>
+    </on-error>
+</policies>

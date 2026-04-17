@@ -1,0 +1,74 @@
+<!--
+    Agent Service Logging Policy
+    Agent Service endpoints (/assistants, /threads, /threads/{id}/runs, /threads/{id}/messages)
+    are NOT natively parsed by the built-in LLM logging. This policy explicitly captures
+    the request/response bodies via <trace> so they end up in App Insights 'traces' table.
+
+    Body sizes are limited to 32KB per trace entry to stay within Application Insights limits.
+    Longer bodies are truncated with an indicator.
+
+    NOTE: `context.Request.Body.As<string>(preserveContent: true)` reads and preserves the body
+          so it can still be forwarded to the backend.
+-->
+<policies>
+    <inbound>
+        <base />
+
+        <set-backend-service backend-id="kunlenewfoundry01" />
+
+        <set-variable name="correlationId" value="@(Guid.NewGuid().ToString())" />
+        <set-variable name="threadId" value="@{
+            var path = context.Request.Url.Path ?? string.Empty;
+            var m = System.Text.RegularExpressions.Regex.Match(path, "/threads/([^/]+)");
+            return m.Success ? m.Groups[1].Value : "none";
+        }" />
+
+        <!-- Capture inbound body (max ~32KB) -->
+        <set-variable name="requestBody" value="@{
+            try {
+                var body = context.Request.Body?.As<string>(preserveContent: true) ?? string.Empty;
+                return body.Length > 32768 ? body.Substring(0, 32768) + "...[truncated]" : body;
+            } catch { return "[body read error]"; }
+        }" />
+
+        <trace source="agent-logging" severity="information">
+            <message>@("Agent Request: " + context.Request.Method + " " + context.Request.Url.Path)</message>
+            <metadata name="correlationId" value="@((string)context.Variables["correlationId"])" />
+            <metadata name="threadId" value="@((string)context.Variables["threadId"])" />
+            <metadata name="operationId" value="@(context.Operation.Id)" />
+            <metadata name="requestBody" value="@((string)context.Variables["requestBody"])" />
+        </trace>
+    </inbound>
+
+    <backend>
+        <base />
+    </backend>
+
+    <outbound>
+        <base />
+
+        <set-variable name="responseBody" value="@{
+            try {
+                var body = context.Response.Body?.As<string>(preserveContent: true) ?? string.Empty;
+                return body.Length > 32768 ? body.Substring(0, 32768) + "...[truncated]" : body;
+            } catch { return "[body read error]"; }
+        }" />
+
+        <trace source="agent-logging" severity="information">
+            <message>@("Agent Response: " + context.Response.StatusCode)</message>
+            <metadata name="correlationId" value="@((string)context.Variables["correlationId"])" />
+            <metadata name="threadId" value="@((string)context.Variables["threadId"])" />
+            <metadata name="statusCode" value="@(context.Response.StatusCode.ToString())" />
+            <metadata name="responseBody" value="@((string)context.Variables["responseBody"])" />
+        </trace>
+    </outbound>
+
+    <on-error>
+        <base />
+        <trace source="agent-logging" severity="error">
+            <message>@("Agent Error: " + (context.LastError?.Message ?? "unknown"))</message>
+            <metadata name="correlationId" value="@((string)context.Variables[&quot;correlationId&quot;])" />
+            <metadata name="threadId" value="@((string)context.Variables[&quot;threadId&quot;])" />
+        </trace>
+    </on-error>
+</policies>

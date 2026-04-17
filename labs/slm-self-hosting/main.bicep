@@ -7,6 +7,7 @@
 param apimSku string
 param openAIAPIVersion string = '2024-02-01'
 param selfHostedGatewayName string = 'self-hosted-gateway'
+param deploySelfHostedGateway bool = true
 // ------------------
 //    VARIABLES
 // ------------------
@@ -113,7 +114,7 @@ resource api 'Microsoft.ApiManagement/service/apis@2023-05-01-preview' = {
       displayName: 'AI Model Inference'
       format: 'openapi-link'
       path: 'inference'
-      serviceUrl: 'http://host.docker.internal:5273/v1'
+      serviceUrl: 'http://host.docker.internal:59643/v1'
       protocols: [
         'https', 'http'
       ]
@@ -136,8 +137,25 @@ resource apiPolicy 'Microsoft.ApiManagement/service/apis/policies@2021-12-01-pre
   }
 }
 
+resource apiDiagnosticsAppInsights 'Microsoft.ApiManagement/service/apis/diagnostics@2022-08-01' = {
+  name: 'applicationinsights'
+  parent: api
+  properties: {
+    alwaysLog: 'allErrors'
+    httpCorrelationProtocol: 'W3C'
+    logClientIp: true
+    loggerId: resourceId(resourceGroup().name, 'Microsoft.ApiManagement/service/loggers', apim.name, 'apim-logger')
+    metrics: true
+    verbosity: 'verbose'
+    sampling: {
+      samplingType: 'fixed'
+      percentage: 100
+    }
+  }
+}
 
-resource selfHostedGateway 'Microsoft.ApiManagement/service/gateways@2021-08-01' = {
+
+resource selfHostedGateway 'Microsoft.ApiManagement/service/gateways@2021-08-01' = if (deploySelfHostedGateway) {
   name: selfHostedGatewayName
   parent: apim
   properties:{
@@ -149,7 +167,7 @@ resource selfHostedGateway 'Microsoft.ApiManagement/service/gateways@2021-08-01'
   }
 }
 
-resource gatewayAPIResource 'Microsoft.ApiManagement/service/gateways/apis@2021-08-01' = {
+resource gatewayAPIResource 'Microsoft.ApiManagement/service/gateways/apis@2021-08-01' = if (deploySelfHostedGateway) {
   name: '${apim.name}/${selfHostedGatewayName}/${api.name}'
   properties: {}
 }
