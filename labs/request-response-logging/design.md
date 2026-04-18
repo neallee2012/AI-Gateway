@@ -271,26 +271,64 @@ ApiManagementGatewayLlmLog
 
 可單獨部署、單獨驗證、單獨刪除，不互相干擾。
 
-### 9.3 能力對照矩陣
+### 9.3 能力對照矩陣（已實測 + 官方文件佐證）
 
-| 能力 | 方案 ① | 方案 ③ |
+> ⚠️ **實測修正**：Foundry/Cognitive Services 的 `RequestResponse` log `properties_s` 只包含 `apiName` / `requestTime` / `requestLength` / `responseTime` / `responseLength` / `objectId` 6 個欄位，**不含 token 細節、不含 model deployment name**。
+>
+> Token 數據必須查 `AzureMetrics` 表（`InputTokens` / `OutputTokens` / `TotalTokens` / `ProcessedPromptTokens` / `GeneratedCompletionTokens`），時間粒度為 **PT1M（每分鐘聚合）**，**無法 per-request**。
+>
+> 官方文件：
+> - [Supported log categories - Microsoft.CognitiveServices/accounts](https://learn.microsoft.com/azure/azure-monitor/reference/supported-logs/microsoft-cognitiveservices-accounts-logs)
+> - [Monitoring data reference for Azure OpenAI](https://learn.microsoft.com/azure/ai-foundry/openai/monitor-openai-reference) — token metrics 列在 `Microsoft.CognitiveServices/accounts` namespace 的 platform metrics
+> - [`azure-openai-emit-token-metric` policy](https://learn.microsoft.com/azure/api-management/azure-openai-emit-token-metric-policy) — 官方明示 per-request token 須由 APIM policy 從 response body parse 才能拿到
+
+| 能力 | 方案 ① (APIM body logging) | 方案 ③ (Foundry Diagnostic) |
 |---|:-:|:-:|
 | 完整 prompt body | ✅ (≤256KB) | ❌ |
-| 完整 completion body | ⚠️ R3 截尾 | ❌ |
-| `prompt_tokens` | ⚠️ 在截斷 body 內 | ✅ |
-| `completion_tokens` | ⚠️ 在截斷 body 內 | ✅ |
-| `reasoning_tokens` 細項 | ❌ | ✅ |
+| 完整 completion body | ⚠️ R3 末尾截斷 | ❌ |
+| **per-request** `prompt_tokens` | ⚠️ 從截斷 body 內 parse | ❌ |
+| **per-request** `completion_tokens` | ⚠️ 從截斷 body 內 parse | ❌ |
+| **聚合** token（per-deployment, per-minute） | ❌ | ✅ AzureMetrics |
+| `requestLength` / `responseLength`（bytes） | ❌ | ✅ |
+| Model deployment per-request | ✅ | ❌（只在 metric dimension） |
+| `reasoning_tokens` 細項 | ⚠️ body 內 | ❌ |
+| latency / status per-request | ✅ | ✅ |
 | Streaming SSE 安全 | ⚠️ R4 風險 | ✅ 不經 APIM |
-| Streaming 取 token | ✅ APIM 內建 parse | ⚠️ 需 client 帶 `stream_options.include_usage=True` |
 | API 性能影響 | 低 | 零（不在 hot path） |
-| 跨 client 統一 | ✅ | ✅ |
-| 中央治理 | ✅ | ✅ |
+| 跨 client 統一治理 | ✅ | ✅ |
+| 長期保留成本 | LAW GB 計費 | LAW GB 計費（可加 Storage 歸檔） |
 
-### 9.4 決策樹
+### 9.3.1 方案 ③ 實際適用場景
 
-- 只要 token 計費 / SLA / 異常告警 → **方案 ③** 即可（最便宜）
-- 要看完整 prompt/completion 但 ≤256KB → **方案 ①** 即可
-- 要完整 + token + 合規稽核 → **方案 ① + 方案 ③ 並存**
+✅ **適合**：
+- 計費 / 成本分析（按 deployment 聚合 token）
+- SLA 監控（latency / error rate per request）
+- 流量趨勢（request count / response bytes per minute）
+- 安全稽核（誰、何時、從哪 IP 呼叫、status）
+- 控制平面審計（`Audit` category）
+
+❌ **不適合**：
+- per-request token 用量（只能 aggregate）
+- 看 prompt / completion 內容
+- 取得 model deployment name per request
+
+### 9.3.2 真正能拿 per-request token 的方案
+
+只剩：
+- **APIM `azure-openai-emit-token-metric` policy** — 官方政策，從 response body parse usage → 發成 custom metric
+  - ⚠️ 對 streaming 仍要 `Body.As<string>(preserveContent:true)` → 同樣踩 R4
+  - ⚠️ 開源模型（Kimi/DeepSeek）的 usage 欄位格式不一定相容
+- **APIM body logging（方案 ①）** — body 內含 usage（如果沒被截）
+- **Client SDK 自行記錄**（方案 B）— 可被繞過，不符治理
+
+### 9.4 決策樹（修正版）
+
+| 需求 | 推薦方案 |
+|---|---|
+| Token 計費 / SLA / 異常告警（聚合即可） | **方案 ③** 即可（最便宜、無 R4 風險） |
+| 看完整 prompt/completion 內容 (≤256KB) | **方案 ①**（接受截斷風險） |
+| per-request token 數據 | **方案 ① + APIM emit-token-metric policy** |
+| 完整稽核 + 全文 + 計費 | **方案 ① + 方案 ③ 並存**，未來補方案 C (log-to-eventhub) |
 
 ### 9.5 驗證流程
 

@@ -1,124 +1,162 @@
 // ============================================================================
-//  KQL Queries for Solution ③ - Foundry Diagnostic Settings
+//  KQL Queries for Solution ③ - Foundry Diagnostic Settings (修正版)
 // ============================================================================
-//  ⚠️ 這些 query 必須在【方案 ③ 專屬的 LAW】上執行 (log-foundry-diag-*)
-//      若在方案 ① 的 LAW (log-aigw-*) 上跑，會找不到資料。
+//  ⚠️ 重要修正：Cognitive Services / Foundry 的 RequestResponse log 的 properties_s
+//      只有 metadata，不含 prompt_tokens / completion_tokens / model deployment 等。
 //
-//  選 LAW：
-//    Azure Portal → Log Analytics workspaces → 選 log-foundry-diag-xxxxx → Logs
+//      實測 properties_s 內容：
+//      {
+//        "apiName": "OpenAI Language Model Instance API",
+//        "requestTime": 639120955371927591,
+//        "requestLength": 162,
+//        "responseTime": 639120955428634748,
+//        "responseLength": 3521,
+//        "objectId": "..."
+//      }
+//
+//      要拿 Token 數據必須查 AzureMetrics 表（per-deployment 聚合，不能 per-request）
 // ============================================================================
 
 // ----------------------------------------------------------------------------
 // F1. 健康檢查：今天有沒有任何資料進來？
 // ----------------------------------------------------------------------------
-AzureDiagnostics
+union AzureDiagnostics, AzureMetrics
 | where TimeGenerated > ago(1d)
-| summarize Count = count(), Last = max(TimeGenerated) by Category, ResourceProvider
+| where ResourceProvider == "MICROSOFT.COGNITIVESERVICES"
+| summarize Count = count(), Last = max(TimeGenerated)
+        by Source = iff(isnotempty(Category), strcat("Diag/", Category), strcat("Metric/", MetricName))
 | order by Count desc
 
 
 // ----------------------------------------------------------------------------
-// F2. RequestResponse 主畫面：每筆請求的 metadata + token usage
+// F2. RequestResponse — 每筆請求的 metadata（無 token，無 model deployment）
 // ----------------------------------------------------------------------------
 AzureDiagnostics
 | where TimeGenerated > ago(1h)
 | where ResourceProvider == "MICROSOFT.COGNITIVESERVICES"
 | where Category == "RequestResponse"
 | extend P = parse_json(properties_s)
-| extend Usage = P.usage
 | project TimeGenerated,
           OperationName,
-          Status              = ResultSignature,
+          Status         = ResultSignature,
           DurationMs,
-          Model               = tostring(P.modelDeploymentName),
-          ModelName           = tostring(P.modelName),
-          ApiName             = tostring(P.apiName),
-          PromptTokens        = toint(Usage.prompt_tokens),
-          CompletionTokens    = toint(Usage.completion_tokens),
-          ReasoningTokens     = toint(Usage.completion_tokens_details.reasoning_tokens),
-          CachedTokens        = toint(Usage.prompt_tokens_details.cached_tokens),
-          TotalTokens         = toint(Usage.total_tokens),
-          CallerIP            = CallerIPAddress
+          ApiName        = tostring(P.apiName),
+          RequestLength  = toint(P.requestLength),
+          ResponseLength = toint(P.responseLength),
+          CallerIP       = CallerIPAddress
 | order by TimeGenerated desc
 
 
 // ----------------------------------------------------------------------------
-// F3. Token 用量趨勢（5 分鐘 bucket）
+// F3. Token 用量（從 AzureMetrics 取，per-deployment 聚合，1 分鐘 bucket）
 // ----------------------------------------------------------------------------
-AzureDiagnostics
+AzureMetrics
 | where TimeGenerated > ago(6h)
-| where Category == "RequestResponse"
-| extend P = parse_json(properties_s)
-| extend Total = toint(P.usage.total_tokens),
-         Prompt = toint(P.usage.prompt_tokens),
-         Completion = toint(P.usage.completion_tokens),
-         Model = tostring(P.modelDeploymentName)
-| summarize SumTotal = sum(Total),
-            SumPrompt = sum(Prompt),
-            SumCompletion = sum(Completion),
-            ReqCount = count()
-            by bin(TimeGenerated, 5m), Model
+| where ResourceProvider == "MICROSOFT.COGNITIVESERVICES"
+| where MetricName in ("InputTokens", "OutputTokens", "TotalTokens")
+| summarize Sum = sum(Total) by MetricName, bin(TimeGenerated, 1m)
 | render timechart
 
 
 // ----------------------------------------------------------------------------
-// F4. 錯誤 / 高延遲分析
+// F4. Token 用量（按 deployment 細分）
 // ----------------------------------------------------------------------------
-AzureDiagnostics
-| where TimeGenerated > ago(1h)
-| where Category == "RequestResponse"
-| where ResultSignature !startswith "2"  // non-2xx
-| extend P = parse_json(properties_s)
-| project TimeGenerated, ResultSignature, DurationMs,
-          OperationName,
-          Model = tostring(P.modelDeploymentName),
-          ErrorCode = tostring(P.statusCode),
-          Properties = properties_s
-| order by TimeGenerated desc
+AzureMetrics
+| where TimeGenerated > ago(6h)
+| where ResourceProvider == "MICROSOFT.COGNITIVESERVICES"
+| where MetricName == "TotalTokens"
+| summarize Total = sum(Total) by ModelDeploymentName = tostring(parse_json(SeriesId)[0]), bin(TimeGenerated, 5m)
+| render timechart
 
 
 // ----------------------------------------------------------------------------
-// F5. P50/P95/P99 延遲（按 model）
+// F5. P50 / P95 / P99 latency（DurationMs 來自 AzureDiagnostics）
 // ----------------------------------------------------------------------------
 AzureDiagnostics
 | where TimeGenerated > ago(6h)
 | where Category == "RequestResponse"
-| extend P = parse_json(properties_s)
-| extend Model = tostring(P.modelDeploymentName)
-| summarize P50=percentile(DurationMs, 50),
-            P95=percentile(DurationMs, 95),
-            P99=percentile(DurationMs, 99),
-            Count=count()
-            by Model
+| where ResourceProvider == "MICROSOFT.COGNITIVESERVICES"
+| extend ApiName = tostring(parse_json(properties_s).apiName)
+| summarize P50 = percentile(DurationMs, 50),
+            P95 = percentile(DurationMs, 95),
+            P99 = percentile(DurationMs, 99),
+            Count = count()
+        by ApiName
 
 
 // ----------------------------------------------------------------------------
-// F6. Audit log - 控制平面操作（誰在改 deployment / key）
-// ----------------------------------------------------------------------------
-AzureDiagnostics
-| where TimeGenerated > ago(7d)
-| where Category == "Audit"
-| project TimeGenerated, OperationName, ResultType, CallerIPAddress, identity_claim_appid_g
-| order by TimeGenerated desc
-
-
-// ----------------------------------------------------------------------------
-// F7. 看完整 properties_s 結構（debug 用，第一次部署完先跑這個）
+// F6. 錯誤分析
 // ----------------------------------------------------------------------------
 AzureDiagnostics
 | where TimeGenerated > ago(1h)
 | where Category == "RequestResponse"
+| where ResultSignature !startswith "2"
+| extend P = parse_json(properties_s)
+| project TimeGenerated, ResultSignature, DurationMs,
+          ApiName        = tostring(P.apiName),
+          RequestLength  = toint(P.requestLength),
+          ResponseLength = toint(P.responseLength)
+| order by TimeGenerated desc
+
+
+// ----------------------------------------------------------------------------
+// F7. Audit log - 控制平面操作
+// ----------------------------------------------------------------------------
+AzureDiagnostics
+| where TimeGenerated > ago(7d)
+| where Category == "Audit"
+| project TimeGenerated, OperationName, ResultType, CallerIPAddress
+| order by TimeGenerated desc
+
+
+// ----------------------------------------------------------------------------
+// F8. 看完整 properties_s 結構（debug 用）
+// ----------------------------------------------------------------------------
+AzureDiagnostics
+| where TimeGenerated > ago(1h)
+| where Category == "RequestResponse"
+| where ResourceProvider == "MICROSOFT.COGNITIVESERVICES"
 | project TimeGenerated, OperationName, properties_s
 | take 5
 
 
 // ----------------------------------------------------------------------------
-// F8. AzureMetrics - TPM/RPM 指標
+// F9. 列出所有可用的 token-related metrics（探索用）
 // ----------------------------------------------------------------------------
 AzureMetrics
 | where TimeGenerated > ago(1h)
 | where ResourceProvider == "MICROSOFT.COGNITIVESERVICES"
-| where MetricName in ("TokenTransaction", "ProcessedPromptTokens",
-                       "ProcessedInferenceTokens", "GeneratedCompletionTokens")
-| summarize Sum = sum(Total) by MetricName, bin(TimeGenerated, 5m)
-| render timechart
+| where MetricName has "oken"
+| distinct MetricName
+| order by MetricName asc
+
+
+// ----------------------------------------------------------------------------
+// F10. 整合：把 metadata + token aggregation join 起來（時間區間估算）
+//      ⚠️ 這是「估算」— RequestResponse 是 per-request，Metrics 是聚合，
+//      只能用時間 bucket 對齊，無法精確 join 到單一請求
+// ----------------------------------------------------------------------------
+let timeRange = 30m;
+let bucket = 1m;
+let reqs =
+    AzureDiagnostics
+    | where TimeGenerated > ago(timeRange)
+    | where Category == "RequestResponse"
+    | where ResourceProvider == "MICROSOFT.COGNITIVESERVICES"
+    | extend P = parse_json(properties_s)
+    | summarize ReqCount = count(),
+                AvgDuration = avg(DurationMs),
+                AvgRespBytes = avg(toint(P.responseLength))
+            by Bucket = bin(TimeGenerated, bucket);
+let toks =
+    AzureMetrics
+    | where TimeGenerated > ago(timeRange)
+    | where ResourceProvider == "MICROSOFT.COGNITIVESERVICES"
+    | where MetricName in ("InputTokens","OutputTokens","TotalTokens")
+    | summarize Sum = sum(Total)
+            by Bucket = bin(TimeGenerated, bucket), MetricName
+    | evaluate pivot(MetricName, sum(Sum));
+reqs | join kind=leftouter (toks) on Bucket
+| project Bucket, ReqCount, AvgDuration, AvgRespBytes,
+          InputTokens, OutputTokens, TotalTokens
+| order by Bucket desc
