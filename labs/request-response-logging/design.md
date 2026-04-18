@@ -312,6 +312,18 @@ ApiManagementGatewayLlmLog
 - 看 prompt / completion 內容
 - 取得 model deployment name per request
 
+### 9.3.1.1 重要觀念：Token 永遠只有「數量」，沒有「內容」
+
+| 來源 | 能拿到 | 拿不到 |
+|---|---|---|
+| `AzureMetrics`（`InputTokens`/`OutputTokens`/`TotalTokens`） | Token **count**（PT1M 聚合，per deployment） | ❌ Token 內容 / ❌ 對應到單筆請求 |
+| `AzureDiagnostics` / `RequestResponse` | requestLength / responseLength（**bytes**，非 token） | ❌ Token count / ❌ 文字內容 |
+| APIM body logging（方案 ①） | prompt 文字、completion 文字、response 內 `usage` block（含 token count） | ⚠️ 256KB 截斷 |
+| APIM `emit-token-metric` policy | 每筆請求的 token **count**（自訂 metric，可帶 dimension） | ❌ Token 內容 |
+
+**Token = tokenizer 切出的 sub-word ID，平台只計算「數量」用於計費。**
+要看「使用者問了什麼 / 模型回了什麼」=「prompt/completion 原始文字」，**只能** 從 request/response body 取得 → 必走方案 ① 或 C（log-to-eventhub）。
+
 ### 9.3.2 真正能拿 per-request token 的方案
 
 只剩：
