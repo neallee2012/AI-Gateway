@@ -50,7 +50,8 @@ var storageName     = take(toLower('staigwc${resourceSuffix}'), 24)
 var containerName   = 'capture'
 var apimLoggerName  = 'eh-logger-solutionc'
 
-// Built-in role: Azure Event Hubs Data Sender (kept for reference, see end of file)
+// Built-in role: Azure Event Hubs Data Sender (defined later)
+
 
 
 // ------------------
@@ -127,38 +128,39 @@ resource eh 'Microsoft.EventHub/namespaces/eventhubs@2024-01-01' = {
   }
 }
 
-// SAS rule for APIM logger (connection-string based, simplest)
-resource ehSendRule 'Microsoft.EventHub/namespaces/eventhubs/authorizationRules@2024-01-01' = {
-  parent: eh
-  name: 'apim-send'
+// SAS auth is disabled at tenant policy level — must use Managed Identity.
+// Role assignment: APIM system-assigned MI → Event Hubs Data Sender on namespace
+var ehDataSenderRoleId = '2b629674-e913-4c01-ae53-ef4638d8f975'
+
+resource roleAssign 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(ehNs.id, apimName, ehDataSenderRoleId)
+  scope: ehNs
   properties: {
-    rights: [ 'Send' ]
+    principalId: apim.identity.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', ehDataSenderRoleId)
   }
 }
 
 // ------------------
-//  APIM LOGGER (eventhub type)
+//  APIM LOGGER (eventhub type, Managed Identity auth)
 // ------------------
 
 resource apimLogger 'Microsoft.ApiManagement/service/loggers@2023-05-01-preview' = {
   parent: apim
   name: apimLoggerName
+  dependsOn: [ roleAssign ]
   properties: {
     loggerType: 'azureEventHub'
-    description: 'Solution C — full body logging via Event Hub'
+    description: 'Solution C — full body logging via Event Hub (MI auth)'
     credentials: {
+      endpointAddress: '${ehNs.name}.servicebus.windows.net'
+      identityClientId: 'systemAssigned'
       name: ehName
-      connectionString: listKeys(ehSendRule.id, '2024-01-01').primaryConnectionString
     }
     isBuffered: true
   }
 }
-
-// NOTE: Logger uses Event Hub connection string (SAS) so MI role
-// assignment isn't required. If you switch to MI-based authentication
-// for the APIM logger in the future, add role assignment manually:
-//   az role assignment create --assignee <apim-mi-objectid> \
-//     --role "Azure Event Hubs Data Sender" --scope <eh-namespace-id>
 
 
 // ------------------

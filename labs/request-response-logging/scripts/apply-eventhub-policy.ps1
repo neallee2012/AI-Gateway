@@ -22,29 +22,42 @@ param(
 $ErrorActionPreference = "Stop"
 az account set --subscription $SubscriptionId | Out-Null
 
-$policyFile = "$PSScriptRoot\..\policies\log-to-eventhub-policy.xml"
+$policyFile = "$PSScriptRoot\..\policies\combined-llm-and-eventhub-policy.xml"
 $emptyPolicy = '<policies><inbound><base/></inbound><backend><base/></backend><outbound><base/></outbound><on-error><base/></on-error></policies>'
 
+$apiVersion = "2023-05-01-preview"
+$baseUrl = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.ApiManagement/service/$ApimName/apis/$ApiName"
+if ($OperationId) {
+    $url = "$baseUrl/operations/$OperationId/policies/policy?api-version=$apiVersion"
+} else {
+    $url = "$baseUrl/policies/policy?api-version=$apiVersion"
+}
+
+$token = (az account get-access-token --resource https://management.azure.com --query accessToken -o tsv)
+$headers = @{ Authorization = "Bearer $token"; 'Content-Type' = 'application/json' }
+
 if ($Remove) {
-    Write-Host "[Remove] Resetting policy on $ApiName$(if($OperationId){"/$OperationId"})..." -ForegroundColor Yellow
-    $tmp = New-TemporaryFile
-    Set-Content -Path $tmp -Value $emptyPolicy -NoNewline
-    if ($OperationId) {
-        az apim api operation policy create -g $ResourceGroup --service-name $ApimName --api-id $ApiName --operation-id $OperationId --policy-format rawxml --value-path $tmp.FullName | Out-Null
-    } else {
-        az apim api policy create -g $ResourceGroup --service-name $ApimName --api-id $ApiName --policy-format rawxml --value-path $tmp.FullName | Out-Null
-    }
-    Remove-Item $tmp
-    Write-Host "[Remove] Done." -ForegroundColor Green
+    Write-Host "[Remove] Restoring Solution 1 policy on $ApiName$(if($OperationId){"/$OperationId"})..." -ForegroundColor Yellow
+    $solution1File = "$PSScriptRoot\..\policies\llm-logging-policy.xml"
+    if (-not (Test-Path $solution1File)) { Write-Error "Solution 1 policy not found: $solution1File"; exit 1 }
+    $xml = Get-Content -Path $solution1File -Raw
+    $body = @{ properties = @{ format = 'rawxml'; value = $xml } } | ConvertTo-Json -Compress -Depth 5
+    Invoke-RestMethod -Method Put -Uri $url -Headers $headers -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ContentType 'application/json' | Out-Null
+    Write-Host "[Remove] Done. Solution 1 restored." -ForegroundColor Green
     return
 }
 
 if (-not (Test-Path $policyFile)) { Write-Error "Policy file not found: $policyFile"; exit 1 }
 
 Write-Host "[Apply] Applying Solution C policy to $ApiName$(if($OperationId){"/$OperationId"})..." -ForegroundColor Cyan
-if ($OperationId) {
-    az apim api operation policy create -g $ResourceGroup --service-name $ApimName --api-id $ApiName --operation-id $OperationId --policy-format rawxml --value-path $policyFile | Out-Null
-} else {
-    az apim api policy create -g $ResourceGroup --service-name $ApimName --api-id $ApiName --policy-format rawxml --value-path $policyFile | Out-Null
+$xml = Get-Content -Path $policyFile -Raw
+$body = @{ properties = @{ format = 'rawxml'; value = $xml } } | ConvertTo-Json -Compress -Depth 5
+try {
+    Invoke-RestMethod -Method Put -Uri $url -Headers $headers -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ContentType 'application/json' | Out-Null
+    Write-Host "[Apply] Done. Trigger by sending header: X-Logging-Channel: solution-c" -ForegroundColor Green
+} catch {
+    Write-Host "ERROR:" -ForegroundColor Red
+    if ($_.ErrorDetails) { Write-Host $_.ErrorDetails.Message }
+    else { Write-Host $_.Exception.Message }
+    exit 1
 }
-Write-Host "[Apply] Done. Trigger by sending header: X-Logging-Channel: solution-c" -ForegroundColor Green

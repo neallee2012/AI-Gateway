@@ -1,18 +1,30 @@
 <!--
-  Solution C — log-to-eventhub policy fragment (header-keyed isolation)
-  =====================================================================
-  KEY DESIGN: only requests with header `X-Logging-Channel: solution-c`
-  trigger Event Hub logging. Solution ① (AppInsights) keeps running for
-  ALL requests untouched. This lets you A/B test independently.
-
-  Apply via apply-eventhub-policy.ps1 to a SPECIFIC API or operation.
-  Logger name MUST match `eh-logger-solutionc` (created by bicep).
+    COMBINED policy: Solution ① (LLM logging) + Solution C (Event Hub, header-keyed)
+    =================================================================================
+    Solution ① portion: unchanged from llm-logging-policy.xml (preserves Solution 1)
+    Solution C portion: only fires when X-Logging-Channel: solution-c header is sent
+                        — zero impact on normal traffic
 -->
 <policies>
   <inbound>
     <base />
-    <!-- CRITICAL: preserve backend routing from original API policy -->
     <set-backend-service backend-id="kunlenewfoundry01" />
+    <set-variable name="correlationId" value="@(Guid.NewGuid().ToString())" />
+    <trace source="llm-logging" severity="information">
+      <message>@("LLM Request: " + context.Request.Url.Path)</message>
+      <metadata name="correlationId" value="@((string)context.Variables["correlationId"])" />
+      <metadata name="subscriptionId" value="@(context.Subscription != null ? context.Subscription.Id : "anonymous")" />
+      <metadata name="apiId" value="@(context.Api.Id)" />
+      <metadata name="operationId" value="@(context.Operation.Id)" />
+      <metadata name="clientIp" value="@(context.Request.IpAddress)" />
+    </trace>
+    <llm-emit-token-metric namespace="llm-logging">
+      <dimension name="Subscription ID" value="@(context.Subscription != null ? context.Subscription.Id : "anonymous")" />
+      <dimension name="API ID" value="@(context.Api.Id)" />
+      <dimension name="Operation ID" value="@(context.Operation.Id)" />
+      <dimension name="Correlation ID" value="@((string)context.Variables["correlationId"])" />
+    </llm-emit-token-metric>
+    <!-- ===== Solution C: header-keyed =============================== -->
     <choose>
       <when condition="@(context.Request.Headers.ContainsKey("X-Logging-Channel") ? context.Request.Headers["X-Logging-Channel"].FirstOrDefault() == "solution-c" : false)">
         <set-variable name="solc-enabled" value="true" />
@@ -25,21 +37,21 @@
     </choose>
   </inbound>
   <backend>
-    <base />
+    <retry condition="@(context.Response.StatusCode == 429 || context.Response.StatusCode == 503 || context.Response.StatusCode == 504)" count="3" interval="2" delta="2" max-interval="10" first-fast-retry="false">
+      <forward-request buffer-request-body="true" />
+    </retry>
   </backend>
   <outbound>
     <base />
+    <trace source="llm-logging" severity="information">
+      <message>@("LLM Response status: " + context.Response.StatusCode)</message>
+      <metadata name="correlationId" value="@((string)context.Variables.GetValueOrDefault("correlationId", ""))" />
+      <metadata name="statusCode" value="@(context.Response.StatusCode.ToString())" />
+    </trace>
+    <!-- ===== Solution C: header-keyed log-to-eventhub =============== -->
     <choose>
       <when condition="@((string)context.Variables.GetValueOrDefault("solc-enabled","false") == "true")">
-        <!-- Read response body once. preserveContent keeps the original stream for the caller. -->
         <set-variable name="solc-response-body" value="@(context.Response.Body.As<string>(preserveContent: true))" />
-        <!--
-          Chunk handling: Event Hub Standard supports up to ~1 MB per event.
-          We split body into ~700KB chunks to be safe and emit one EH event per chunk.
-          Each event carries the same correlation-id + chunk index/total so downstream
-          (ADX/Synapse) can stitch back.
-        -->
-        <set-variable name="solc-chunk-size" value="700000" />
         <set-variable name="solc-req-chunks" value="@{
           var s = (string)context.Variables["solc-request-body"] ?? "";
           var n = (int)Math.Ceiling((double)s.Length / 700000);
@@ -73,7 +85,6 @@
           );
           return meta.ToString(Newtonsoft.Json.Formatting.None);
         }</log-to-eventhub>
-        <!-- Request body chunks -->
         <log-to-eventhub logger-id="eh-logger-solutionc">@{
           var corr = (string)context.Variables["solc-correlation-id"];
           var body = (string)context.Variables["solc-request-body"] ?? "";
@@ -93,7 +104,6 @@
           }
           return sb.ToString();
         }</log-to-eventhub>
-        <!-- Response body chunks -->
         <log-to-eventhub logger-id="eh-logger-solutionc">@{
           var corr = (string)context.Variables["solc-correlation-id"];
           var body = (string)context.Variables["solc-response-body"] ?? "";
@@ -118,5 +128,9 @@
   </outbound>
   <on-error>
     <base />
+    <trace source="llm-logging" severity="error">
+      <message>@("LLM Error: " + (context.LastError?.Message ?? "unknown"))</message>
+      <metadata name="correlationId" value="@((string)context.Variables["correlationId"])" />
+    </trace>
   </on-error>
 </policies>
