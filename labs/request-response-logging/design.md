@@ -247,3 +247,68 @@ ApiManagementGatewayLlmLog
 3. **結構化分析** — Event Hub + Stream Analytics → Cosmos DB（參考 `labs/message-storing`）
 4. **告警** — 設定 Azure Monitor Alert 監控異常 token 使用
 5. **跨 Thread 關聯** — 利用 Agent Service 的 `thread_id` 作為 correlation key
+
+
+---
+
+## 9. 雙軌日誌方案（方案 ① 與方案 ③ 並存）
+
+### 9.1 為何要雙軌
+
+方案 ①（APIM body logging → AppInsights）受 R1/R3/R4 三大限制；方案 ③（Foundry Diagnostic Settings → 專屬 LAW）能繞開但沒有 body。兩者**互補不取代**。
+
+### 9.2 部署隔離設計
+
+| 層 | 方案 ① | 方案 ③ |
+|---|---|---|
+| Bicep | `bicep/logging.bicep` | `bicep/foundry-diagnostics.bicep`（獨立檔） |
+| 部署 script | `scripts/deploy-logging.ps1` | `scripts/deploy-foundry-diag.ps1`（含 -Destroy） |
+| LAW | `log-aigw-*` | `log-foundry-diag-*`（**不同 workspace**） |
+| 主表 | `AppDependencies` | `AzureDiagnostics` |
+| KQL | `kql/queries.kql` | `kql/queries-foundry-diag.kql` |
+| 比對 KQL | — | `kql/queries-comparison.kql`（cross-workspace） |
+| Notebook | `notebooks/test-logging.ipynb` | `notebooks/test-solution3-foundry-diag.ipynb` |
+
+可單獨部署、單獨驗證、單獨刪除，不互相干擾。
+
+### 9.3 能力對照矩陣
+
+| 能力 | 方案 ① | 方案 ③ |
+|---|:-:|:-:|
+| 完整 prompt body | ✅ (≤256KB) | ❌ |
+| 完整 completion body | ⚠️ R3 截尾 | ❌ |
+| `prompt_tokens` | ⚠️ 在截斷 body 內 | ✅ |
+| `completion_tokens` | ⚠️ 在截斷 body 內 | ✅ |
+| `reasoning_tokens` 細項 | ❌ | ✅ |
+| Streaming SSE 安全 | ⚠️ R4 風險 | ✅ 不經 APIM |
+| Streaming 取 token | ✅ APIM 內建 parse | ⚠️ 需 client 帶 `stream_options.include_usage=True` |
+| API 性能影響 | 低 | 零（不在 hot path） |
+| 跨 client 統一 | ✅ | ✅ |
+| 中央治理 | ✅ | ✅ |
+
+### 9.4 決策樹
+
+- 只要 token 計費 / SLA / 異常告警 → **方案 ③** 即可（最便宜）
+- 要看完整 prompt/completion 但 ≤256KB → **方案 ①** 即可
+- 要完整 + token + 合規稽核 → **方案 ① + 方案 ③ 並存**
+
+### 9.5 驗證流程
+
+1. 部署方案 ③：`.\scripts\deploy-foundry-diag.ps1`
+2. 跑 `test-solution3-foundry-diag.ipynb` TC-07 a/b/c（每筆帶 `RUN_ID`）
+3. 方案 ③ LAW 用 `queries-foundry-diag.kql` F2/F7 驗證 token
+4. 方案 ① LAW 用 `queries.kql` 看 body
+5. 並排比較用 `queries-comparison.kql` C1/C2/C3
+
+---
+
+## 10. 根因 (R1-R6) 對應官方文件
+
+| ID | 根因 | 官方文件 |
+|---|---|---|
+| R1 | `maxSizeInBytes` 上限 262144 | [APIM Diagnostic ARM Schema](https://learn.microsoft.com/azure/templates/microsoft.apimanagement/service/diagnostics) / [LLM logging policies](https://learn.microsoft.com/azure/api-management/llm-logging-policies) |
+| R2 | Reasoning model | [Foundry reasoning models](https://learn.microsoft.com/azure/ai-foundry/concepts/models-reasoning) |
+| R3 | SSE 順序 reasoning → content | [DeepSeek-R1 reasoning_content](https://api-docs.deepseek.com/guides/reasoning_model) |
+| R4 | APIM policy 讀 body 破壞 streaming | [APIM Known Issues](https://learn.microsoft.com/azure/api-management/api-management-known-issues) |
+| R5 | App Insights trace 32KB / properties 8KB | [AI telemetry data model](https://learn.microsoft.com/azure/azure-monitor/app/data-model-complete) |
+| R6 | Foundry concurrent quota | [Foundry quotas and limits](https://learn.microsoft.com/azure/ai-foundry/foundry-models/quotas-limits) |

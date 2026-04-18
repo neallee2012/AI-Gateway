@@ -1,0 +1,111 @@
+// ============================================================================
+//  方案 ① vs 方案 ③ 並排比較查詢
+// ============================================================================
+//  使用方式：
+//    這些 query 需要 cross-workspace 寫法 (workspace("名稱"))
+//    或在 Portal 切換到對應 LAW 各跑一次。
+//
+//    請替換下面變數為你的實際資源名稱：
+//      <SUB_ID>            訂閱 ID
+//      <RG>                resource group (e.g. newfoundry01)
+//      <LAW1_NAME>         方案 ① LAW (log-aigw-xxxxx)
+//      <LAW3_NAME>         方案 ③ LAW (log-foundry-diag-xxxxx)
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// C1. 同一段時間，方案 ① vs 方案 ③ 各記了幾筆？
+//     (在方案 ① 的 LAW 上執行)
+// ----------------------------------------------------------------------------
+let timeRange = 1h;
+let solution1 =
+    AppDependencies
+    | where TimeGenerated > ago(timeRange)
+    | where Name has "chat/completions"
+    | summarize Solution1_Count = count();
+let solution3 =
+    workspace("<LAW3_NAME>").AzureDiagnostics
+    | where TimeGenerated > ago(timeRange)
+    | where Category == "RequestResponse"
+    | summarize Solution3_Count = count();
+solution1 | extend dummy=1
+| join (solution3 | extend dummy=1) on dummy
+| project Solution1_Count, Solution3_Count
+
+
+// ----------------------------------------------------------------------------
+// C2. 同一個請求兩邊都看得到嗎？(以時間 + duration 近似匹配)
+//     方案 ① 沒有 model deployment id, 方案 ③ 沒有 APIM correlationId,
+//     所以無法 100% join，用時間區間 +/- 2 秒近似。
+// ----------------------------------------------------------------------------
+let timeRange = 1h;
+let s1 =
+    AppDependencies
+    | where TimeGenerated > ago(timeRange)
+    | where Name has "chat/completions"
+    | extend P = parse_json(tostring(Properties))
+    | project S1_Time = TimeGenerated,
+              S1_Duration = DurationMs,
+              S1_ResultCode = ResultCode,
+              S1_RequestSize = strlen(tostring(P["Request-Body"])),
+              S1_ResponseSize = strlen(tostring(P["Response-Body"]));
+let s3 =
+    workspace("<LAW3_NAME>").AzureDiagnostics
+    | where TimeGenerated > ago(timeRange)
+    | where Category == "RequestResponse"
+    | extend P = parse_json(properties_s)
+    | project S3_Time = TimeGenerated,
+              S3_Duration = DurationMs,
+              S3_Status = ResultSignature,
+              S3_PromptTokens = toint(P.usage.prompt_tokens),
+              S3_CompletionTokens = toint(P.usage.completion_tokens),
+              S3_TotalTokens = toint(P.usage.total_tokens),
+              S3_Model = tostring(P.modelDeploymentName);
+s1 | join kind=leftouter (s3) on $left.S1_Time between (datetime_add('second', -2, $right.S3_Time) .. datetime_add('second', 2, $right.S3_Time))
+| project S1_Time, S1_Duration, S1_ResultCode, S1_RequestSize, S1_ResponseSize,
+          S3_Time, S3_Duration, S3_Status, S3_PromptTokens, S3_CompletionTokens, S3_TotalTokens, S3_Model
+| order by S1_Time desc
+
+
+// ----------------------------------------------------------------------------
+// C3. 方案 ① 截斷率 vs 方案 ③ 是否有 token usage
+// ----------------------------------------------------------------------------
+let s1_truncated =
+    AppDependencies
+    | where TimeGenerated > ago(1h)
+    | where Name has "chat/completions"
+    | extend P = parse_json(tostring(Properties))
+    | extend RespSize = strlen(tostring(P["Response-Body"]))
+    | summarize Total=count(),
+                Truncated=countif(RespSize >= 262000),
+                AvgSize=avg(RespSize),
+                MaxSize=max(RespSize)
+    | extend Truncation_Rate_Pct = round(100.0 * Truncated / Total, 2)
+    | extend Source = "Solution ①";
+let s3_token_coverage =
+    workspace("<LAW3_NAME>").AzureDiagnostics
+    | where TimeGenerated > ago(1h)
+    | where Category == "RequestResponse"
+    | extend P = parse_json(properties_s)
+    | extend HasTokens = isnotnull(P.usage.total_tokens)
+    | summarize Total=count(),
+                With_Tokens=countif(HasTokens),
+                Token_Coverage_Pct=round(100.0 * countif(HasTokens) / count(), 2);
+print "--- Solution ① (APIM body logging) ---";
+s1_truncated;
+print "--- Solution ③ (Foundry diagnostic) ---";
+s3_token_coverage
+
+
+// ----------------------------------------------------------------------------
+// C4. 兩方案能力對照
+// ----------------------------------------------------------------------------
+print Capability="完整 prompt body",        Solution1="✅ 但 256KB 截斷",  Solution3="❌";
+print Capability="完整 completion body",    Solution1="❌ R3 末尾被截",     Solution3="❌";
+print Capability="prompt_tokens",            Solution1="⚠️ 在截斷的 body",   Solution3="✅";
+print Capability="completion_tokens",        Solution1="⚠️ 在截斷的 body",   Solution3="✅";
+print Capability="reasoning_tokens 細項",    Solution1="❌",                  Solution3="✅";
+print Capability="latency / status",         Solution1="✅",                  Solution3="✅";
+print Capability="streaming SSE 安全性",     Solution1="⚠️ R4 風險",         Solution3="✅ 不經 APIM";
+print Capability="跨 client 統一",           Solution1="✅",                  Solution3="✅";
+print Capability="hot path 影響",            Solution1="低",                  Solution3="零";
+print Capability="長期保留成本",             Solution1="LAW 高",              Solution3="LAW 高(可加 Storage)";

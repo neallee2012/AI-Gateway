@@ -1,0 +1,124 @@
+// ============================================================================
+//  KQL Queries for Solution ③ - Foundry Diagnostic Settings
+// ============================================================================
+//  ⚠️ 這些 query 必須在【方案 ③ 專屬的 LAW】上執行 (log-foundry-diag-*)
+//      若在方案 ① 的 LAW (log-aigw-*) 上跑，會找不到資料。
+//
+//  選 LAW：
+//    Azure Portal → Log Analytics workspaces → 選 log-foundry-diag-xxxxx → Logs
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// F1. 健康檢查：今天有沒有任何資料進來？
+// ----------------------------------------------------------------------------
+AzureDiagnostics
+| where TimeGenerated > ago(1d)
+| summarize Count = count(), Last = max(TimeGenerated) by Category, ResourceProvider
+| order by Count desc
+
+
+// ----------------------------------------------------------------------------
+// F2. RequestResponse 主畫面：每筆請求的 metadata + token usage
+// ----------------------------------------------------------------------------
+AzureDiagnostics
+| where TimeGenerated > ago(1h)
+| where ResourceProvider == "MICROSOFT.COGNITIVESERVICES"
+| where Category == "RequestResponse"
+| extend P = parse_json(properties_s)
+| extend Usage = P.usage
+| project TimeGenerated,
+          OperationName,
+          Status              = ResultSignature,
+          DurationMs,
+          Model               = tostring(P.modelDeploymentName),
+          ModelName           = tostring(P.modelName),
+          ApiName             = tostring(P.apiName),
+          PromptTokens        = toint(Usage.prompt_tokens),
+          CompletionTokens    = toint(Usage.completion_tokens),
+          ReasoningTokens     = toint(Usage.completion_tokens_details.reasoning_tokens),
+          CachedTokens        = toint(Usage.prompt_tokens_details.cached_tokens),
+          TotalTokens         = toint(Usage.total_tokens),
+          CallerIP            = CallerIPAddress
+| order by TimeGenerated desc
+
+
+// ----------------------------------------------------------------------------
+// F3. Token 用量趨勢（5 分鐘 bucket）
+// ----------------------------------------------------------------------------
+AzureDiagnostics
+| where TimeGenerated > ago(6h)
+| where Category == "RequestResponse"
+| extend P = parse_json(properties_s)
+| extend Total = toint(P.usage.total_tokens),
+         Prompt = toint(P.usage.prompt_tokens),
+         Completion = toint(P.usage.completion_tokens),
+         Model = tostring(P.modelDeploymentName)
+| summarize SumTotal = sum(Total),
+            SumPrompt = sum(Prompt),
+            SumCompletion = sum(Completion),
+            ReqCount = count()
+            by bin(TimeGenerated, 5m), Model
+| render timechart
+
+
+// ----------------------------------------------------------------------------
+// F4. 錯誤 / 高延遲分析
+// ----------------------------------------------------------------------------
+AzureDiagnostics
+| where TimeGenerated > ago(1h)
+| where Category == "RequestResponse"
+| where ResultSignature !startswith "2"  // non-2xx
+| extend P = parse_json(properties_s)
+| project TimeGenerated, ResultSignature, DurationMs,
+          OperationName,
+          Model = tostring(P.modelDeploymentName),
+          ErrorCode = tostring(P.statusCode),
+          Properties = properties_s
+| order by TimeGenerated desc
+
+
+// ----------------------------------------------------------------------------
+// F5. P50/P95/P99 延遲（按 model）
+// ----------------------------------------------------------------------------
+AzureDiagnostics
+| where TimeGenerated > ago(6h)
+| where Category == "RequestResponse"
+| extend P = parse_json(properties_s)
+| extend Model = tostring(P.modelDeploymentName)
+| summarize P50=percentile(DurationMs, 50),
+            P95=percentile(DurationMs, 95),
+            P99=percentile(DurationMs, 99),
+            Count=count()
+            by Model
+
+
+// ----------------------------------------------------------------------------
+// F6. Audit log - 控制平面操作（誰在改 deployment / key）
+// ----------------------------------------------------------------------------
+AzureDiagnostics
+| where TimeGenerated > ago(7d)
+| where Category == "Audit"
+| project TimeGenerated, OperationName, ResultType, CallerIPAddress, identity_claim_appid_g
+| order by TimeGenerated desc
+
+
+// ----------------------------------------------------------------------------
+// F7. 看完整 properties_s 結構（debug 用，第一次部署完先跑這個）
+// ----------------------------------------------------------------------------
+AzureDiagnostics
+| where TimeGenerated > ago(1h)
+| where Category == "RequestResponse"
+| project TimeGenerated, OperationName, properties_s
+| take 5
+
+
+// ----------------------------------------------------------------------------
+// F8. AzureMetrics - TPM/RPM 指標
+// ----------------------------------------------------------------------------
+AzureMetrics
+| where TimeGenerated > ago(1h)
+| where ResourceProvider == "MICROSOFT.COGNITIVESERVICES"
+| where MetricName in ("TokenTransaction", "ProcessedPromptTokens",
+                       "ProcessedInferenceTokens", "GeneratedCompletionTokens")
+| summarize Sum = sum(Total) by MetricName, bin(TimeGenerated, 5m)
+| render timechart
