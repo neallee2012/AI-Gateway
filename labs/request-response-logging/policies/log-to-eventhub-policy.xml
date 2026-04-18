@@ -1,0 +1,120 @@
+<!--
+  Solution C — log-to-eventhub policy fragment (header-keyed isolation)
+  =====================================================================
+  KEY DESIGN: only requests with header `X-Logging-Channel: solution-c`
+  trigger Event Hub logging. Solution ① (AppInsights) keeps running for
+  ALL requests untouched. This lets you A/B test independently.
+
+  Apply via apply-eventhub-policy.ps1 to a SPECIFIC API or operation.
+  Logger name MUST match `eh-logger-solutionc` (created by bicep).
+-->
+<policies>
+  <inbound>
+    <base />
+    <choose>
+      <when condition="@(context.Request.Headers.GetValueOrDefault("X-Logging-Channel", "") == "solution-c")">
+        <set-variable name="solc-enabled" value="true" />
+        <set-variable name="solc-correlation-id" value="@(context.Request.Headers.GetValueOrDefault("X-Run-Id", context.RequestId))" />
+        <set-variable name="solc-request-body" value="@(context.Request.Body.As<string>(preserveContent: true))" />
+      </when>
+      <otherwise>
+        <set-variable name="solc-enabled" value="false" />
+      </otherwise>
+    </choose>
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <base />
+    <choose>
+      <when condition="@((bool)context.Variables["solc-enabled"])">
+        <!-- Read response body once. preserveContent keeps the original stream for the caller. -->
+        <set-variable name="solc-response-body" value="@(context.Response.Body.As<string>(preserveContent: true))" />
+        <!--
+          Chunk handling: Event Hub Standard supports up to ~1 MB per event.
+          We split body into ~700KB chunks to be safe and emit one EH event per chunk.
+          Each event carries the same correlation-id + chunk index/total so downstream
+          (ADX/Synapse) can stitch back.
+        -->
+        <set-variable name="solc-chunk-size" value="700000" />
+        <set-variable name="solc-req-chunks" value="@{
+          var s = (string)context.Variables["solc-request-body"] ?? "";
+          var n = (int)Math.Ceiling((double)s.Length / 700000);
+          return n == 0 ? 1 : n;
+        }" />
+        <set-variable name="solc-resp-chunks" value="@{
+          var s = (string)context.Variables["solc-response-body"] ?? "";
+          var n = (int)Math.Ceiling((double)s.Length / 700000);
+          return n == 0 ? 1 : n;
+        }" />
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr   = (string)context.Variables["solc-correlation-id"];
+          var reqLen = ((string)context.Variables["solc-request-body"] ?? "").Length;
+          var respLen= ((string)context.Variables["solc-response-body"] ?? "").Length;
+          var meta = new JObject(
+            new JProperty("kind", "summary"),
+            new JProperty("correlationId", corr),
+            new JProperty("timestamp", DateTime.UtcNow.ToString("o")),
+            new JProperty("apiId", context.Api.Id),
+            new JProperty("operation", context.Operation.Id),
+            new JProperty("method", context.Request.Method),
+            new JProperty("url", context.Request.OriginalUrl.ToString()),
+            new JProperty("status", context.Response.StatusCode),
+            new JProperty("durationMs", (long)(DateTime.UtcNow - context.Timestamp).TotalMilliseconds),
+            new JProperty("requestLength", reqLen),
+            new JProperty("responseLength", respLen),
+            new JProperty("requestChunks", (int)context.Variables["solc-req-chunks"]),
+            new JProperty("responseChunks", (int)context.Variables["solc-resp-chunks"]),
+            new JProperty("subscriptionId", context.Subscription?.Id ?? ""),
+            new JProperty("clientIp", context.Request.IpAddress)
+          );
+          return meta.ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <!-- Request body chunks -->
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 700000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var sb = new System.Text.StringBuilder();
+          for (int i = 0; i < total; i++) {
+            var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+            var ev = new JObject(
+              new JProperty("kind", "request-body"),
+              new JProperty("correlationId", corr),
+              new JProperty("chunkIndex", i),
+              new JProperty("chunkTotal", total),
+              new JProperty("payload", chunk)
+            );
+            sb.AppendLine(ev.ToString(Newtonsoft.Json.Formatting.None));
+          }
+          return sb.ToString();
+        }</log-to-eventhub>
+        <!-- Response body chunks -->
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 700000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var sb = new System.Text.StringBuilder();
+          for (int i = 0; i < total; i++) {
+            var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+            var ev = new JObject(
+              new JProperty("kind", "response-body"),
+              new JProperty("correlationId", corr),
+              new JProperty("chunkIndex", i),
+              new JProperty("chunkTotal", total),
+              new JProperty("payload", chunk)
+            );
+            sb.AppendLine(ev.ToString(Newtonsoft.Json.Formatting.None));
+          }
+          return sb.ToString();
+        }</log-to-eventhub>
+      </when>
+    </choose>
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

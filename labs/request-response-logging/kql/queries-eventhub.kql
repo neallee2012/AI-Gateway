@@ -1,0 +1,96 @@
+// =====================================================================
+//  Solution C — Reading captured logs (Blob/ADX patterns)
+// =====================================================================
+//  Event Hub Capture writes Avro files to Blob with this layout:
+//    {Namespace}/{EventHub}/{PartitionId}/{Year}/{Month}/{Day}/{Hour}/{Minute}/{Second}
+//  Each Avro record contains:
+//    Body (binary) — your JSON event from log-to-eventhub policy
+//    EnqueuedTimeUtc, SequenceNumber, Offset, SystemProperties
+//
+//  THREE WAYS TO QUERY:
+//   A) Storage Explorer / Azure Storage Explorer — manual download + jq
+//   B) Azure Data Explorer (ADX) external table over Blob (recommended)
+//   C) Synapse Serverless OPENROWSET
+//
+//  Below: ADX patterns (most queryable). Run in an ADX cluster you own.
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  C1. (one-time) Create external table over Capture Blob
+// ---------------------------------------------------------------------
+//  Replace <storage-account>, <container>, <SAS-or-MI>
+.create external table ApimLlmCapture (
+    Body: dynamic,                      // parsed JSON
+    EnqueuedTimeUtc: datetime,
+    SequenceNumber: long,
+    Offset: string,
+    SystemProperties: dynamic,
+    Properties: dynamic
+)
+kind=blob
+partition by (Date:datetime = bin(EnqueuedTimeUtc, 1d))
+pathformat = (datetime_pattern("'/' yyyy '/' MM '/' dd", Date))
+dataformat=avro
+(
+    h@'https://<storage-account>.blob.core.windows.net/capture;<SAS>'
+)
+
+// ---------------------------------------------------------------------
+//  C2. Latest 100 events (raw)
+// ---------------------------------------------------------------------
+external_table('ApimLlmCapture')
+| top 100 by EnqueuedTimeUtc desc
+| project EnqueuedTimeUtc, kind = tostring(Body.kind), correlationId = tostring(Body.correlationId), Body
+
+// ---------------------------------------------------------------------
+//  C3. Reconstruct full request/response by correlationId
+// ---------------------------------------------------------------------
+let CorrId = "<paste your X-Run-Id>";
+external_table('ApimLlmCapture')
+| where Body.correlationId == CorrId
+| extend kind = tostring(Body.kind),
+         chunkIndex = toint(Body.chunkIndex),
+         chunkTotal = toint(Body.chunkTotal),
+         payload    = tostring(Body.payload)
+| order by kind asc, chunkIndex asc
+| summarize Reassembled = strcat_array(make_list(payload), "") by kind
+| project kind, length = strlen(Reassembled), Reassembled
+
+// ---------------------------------------------------------------------
+//  C4. Per-correlation summary (status, duration, byte count, chunk count)
+// ---------------------------------------------------------------------
+external_table('ApimLlmCapture')
+| where Body.kind == "summary"
+| project EnqueuedTimeUtc,
+          correlationId   = tostring(Body.correlationId),
+          status          = toint(Body.status),
+          durationMs      = tolong(Body.durationMs),
+          requestLength   = tolong(Body.requestLength),
+          responseLength  = tolong(Body.responseLength),
+          requestChunks   = toint(Body.requestChunks),
+          responseChunks  = toint(Body.responseChunks),
+          api             = tostring(Body.apiId),
+          operation       = tostring(Body.operation),
+          method          = tostring(Body.method),
+          url             = tostring(Body.url)
+| order by EnqueuedTimeUtc desc
+
+// ---------------------------------------------------------------------
+//  C5. Find truncation-prone requests (was 256KB an issue?)
+// ---------------------------------------------------------------------
+//  In Solution ① anything > 262144 bytes gets cut off in AppInsights.
+//  In Solution C we keep all of it (chunked). Sanity-check here:
+external_table('ApimLlmCapture')
+| where Body.kind == "summary"
+| where toint(Body.responseLength) > 262144
+| project EnqueuedTimeUtc, correlationId = tostring(Body.correlationId),
+          responseLength = tolong(Body.responseLength),
+          chunks = toint(Body.responseChunks)
+| order by responseLength desc
+
+// ---------------------------------------------------------------------
+//  C6. Cross-validate vs Solution ① (run in App Insights workspace)
+// ---------------------------------------------------------------------
+//  Same correlation: pass X-Run-Id from client. Solution ① will see it
+//  in the request path / headers so you can find the matching Dependency
+//  in AppDependencies and compare ResponseBody size.

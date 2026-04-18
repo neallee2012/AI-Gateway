@@ -251,104 +251,73 @@ ApiManagementGatewayLlmLog
 
 ---
 
-## 9. 雙軌日誌方案（方案 ① 與方案 ③ 並存）
+## 9. 雙軌日誌方案（方案 ① 與方案 C 並存）
 
-### 9.1 為何要雙軌
+### 9.1 為何要雙軌（修正後）
 
-方案 ①（APIM body logging → AppInsights）受 R1/R3/R4 三大限制；方案 ③（Foundry Diagnostic Settings → 專屬 LAW）能繞開但沒有 body。兩者**互補不取代**。
+方案 ①（APIM body logging → AppInsights）受 R1（256KB 截斷）/ R3（reasoning model 末尾被切）/ R4（streaming 讀 body 不穩）三大限制。要徹底解決完整稽核需求，採用 **方案 C（APIM `log-to-eventhub` → Event Hub → Blob Capture）** 並與方案 ① 並存。
+
+> ⚠️ **方案 ③（Foundry Diagnostic Settings）已從本實驗移除**。原因：`RequestResponse` log 只有 metadata（requestLength bytes / responseLength bytes / duration），**完全沒有 prompt / completion 內容，也沒有 per-request token**；token 只在 `AzureMetrics` 表（PT1M 聚合，僅能按 deployment 看每分鐘總量）。對「企業中央稽核完整對話內容」需求幫助有限。詳見 §9.6。
 
 ### 9.2 部署隔離設計
 
-| 層 | 方案 ① | 方案 ③ |
+| 層 | 方案 ① | 方案 C |
 |---|---|---|
-| Bicep | `bicep/logging.bicep` | `bicep/foundry-diagnostics.bicep`（獨立檔） |
-| 部署 script | `scripts/deploy-logging.ps1` | `scripts/deploy-foundry-diag.ps1`（含 -Destroy） |
-| LAW | `log-aigw-*` | `log-foundry-diag-*`（**不同 workspace**） |
-| 主表 | `AppDependencies` | `AzureDiagnostics` |
-| KQL | `kql/queries.kql` | `kql/queries-foundry-diag.kql` |
-| 比對 KQL | — | `kql/queries-comparison.kql`（cross-workspace） |
-| Notebook | `notebooks/test-logging.ipynb` | `notebooks/test-solution3-foundry-diag.ipynb` |
+| Bicep | `bicep/logging.bicep` | `bicep/eventhub-logging.bicep`（獨立檔） |
+| 部署 script | `scripts/deploy-logging.ps1` | `scripts/deploy-eventhub-logging.ps1`（含 -Destroy） |
+| Policy 套用 | `scripts/apply-policy.ps1`（自動掛 inbound LLM logging） | `scripts/apply-eventhub-policy.ps1`（**header-keyed**，預設不啟用） |
+| 觸發條件 | 所有流量 | 僅當 request header `X-Logging-Channel: solution-c` |
+| Logger | `appinsights-logger`（AppInsights 型） | `eh-logger-solutionc`（Event Hub 型） |
+| 落地 | AppInsights → LAW (`log-aigw-*`) | Event Hub → Blob Capture (`staigwc*` / `capture` container, Avro) |
+| 主表 | `AppDependencies` / `traces` | Avro 檔（可外掛 ADX external table 查詢） |
+| 256KB 限制 | 受限 | **不受限**（policy 自動分塊 ≤700KB/event） |
+| KQL / 查詢 | `kql/queries.kql` | `kql/queries-eventhub.kql`（ADX external table 範本） |
+| Notebook | `notebooks/test-logging.ipynb` | `notebooks/test-solution-c-eventhub.ipynb` |
 
-可單獨部署、單獨驗證、單獨刪除，不互相干擾。
+**獨立性保證**：
+- 不同 logger、不同 sink、不同 storage
+- 方案 C 只對帶 `X-Logging-Channel: solution-c` header 的請求觸發 → 對方案 ① 與一般生產流量零影響
+- 每筆請求帶 `X-Run-Id`（=correlationId），事後可拼接 chunk + 跨方案比對
 
-### 9.3 能力對照矩陣（已實測 + 官方文件佐證）
+### 9.3 方案 C 政策關鍵設計
 
-> ⚠️ **實測修正**：Foundry/Cognitive Services 的 `RequestResponse` log `properties_s` 只包含 `apiName` / `requestTime` / `requestLength` / `responseTime` / `responseLength` / `objectId` 6 個欄位，**不含 token 細節、不含 model deployment name**。
->
-> Token 數據必須查 `AzureMetrics` 表（`InputTokens` / `OutputTokens` / `TotalTokens` / `ProcessedPromptTokens` / `GeneratedCompletionTokens`），時間粒度為 **PT1M（每分鐘聚合）**，**無法 per-request**。
->
-> 官方文件：
-> - [Supported log categories - Microsoft.CognitiveServices/accounts](https://learn.microsoft.com/azure/azure-monitor/reference/supported-logs/microsoft-cognitiveservices-accounts-logs)
-> - [Monitoring data reference for Azure OpenAI](https://learn.microsoft.com/azure/ai-foundry/openai/monitor-openai-reference) — token metrics 列在 `Microsoft.CognitiveServices/accounts` namespace 的 platform metrics
-> - [`azure-openai-emit-token-metric` policy](https://learn.microsoft.com/azure/api-management/azure-openai-emit-token-metric-policy) — 官方明示 per-request token 須由 APIM policy 從 response body parse 才能拿到
+`policies/log-to-eventhub-policy.xml`：
 
-| 能力 | 方案 ① (APIM body logging) | 方案 ③ (Foundry Diagnostic) |
-|---|:-:|:-:|
-| 完整 prompt body | ✅ (≤256KB) | ❌ |
-| 完整 completion body | ⚠️ R3 末尾截斷 | ❌ |
-| **per-request** `prompt_tokens` | ⚠️ 從截斷 body 內 parse | ❌ |
-| **per-request** `completion_tokens` | ⚠️ 從截斷 body 內 parse | ❌ |
-| **聚合** token（per-deployment, per-minute） | ❌ | ✅ AzureMetrics |
-| `requestLength` / `responseLength`（bytes） | ❌ | ✅ |
-| Model deployment per-request | ✅ | ❌（只在 metric dimension） |
-| `reasoning_tokens` 細項 | ⚠️ body 內 | ❌ |
-| latency / status per-request | ✅ | ✅ |
-| Streaming SSE 安全 | ⚠️ R4 風險 | ✅ 不經 APIM |
-| API 性能影響 | 低 | 零（不在 hot path） |
-| 跨 client 統一治理 | ✅ | ✅ |
-| 長期保留成本 | LAW GB 計費 | LAW GB 計費（可加 Storage 歸檔） |
+1. **隔離**：`<choose>` 判斷 header `X-Logging-Channel == "solution-c"`，僅在符合時才執行 EH 邏輯
+2. **完整 body 保留**：`Body.As<string>(preserveContent: true)` 確保下游仍能正常收到 response
+3. **分塊**：每 event ≤ 700KB（EH Standard 上限 1MB，留安全邊界）
+4. **三類 event**：
+   - `kind=summary` — 1 筆，含 status / duration / requestLength / responseLength / chunkTotal / correlationId
+   - `kind=request-body` — N 筆，依 chunkIndex 排序拼回
+   - `kind=response-body` — M 筆，依 chunkIndex 排序拼回
+5. **correlation**：客戶端傳 `X-Run-Id` → policy 用作 correlationId；若沒帶則 fallback 到 `context.RequestId`
 
-### 9.3.1 方案 ③ 實際適用場景
+### 9.4 決策樹
 
-✅ **適合**：
-- 計費 / 成本分析（按 deployment 聚合 token）
-- SLA 監控（latency / error rate per request）
-- 流量趨勢（request count / response bytes per minute）
-- 安全稽核（誰、何時、從哪 IP 呼叫、status）
-- 控制平面審計（`Audit` category）
-
-❌ **不適合**：
-- per-request token 用量（只能 aggregate）
-- 看 prompt / completion 內容
-- 取得 model deployment name per request
-
-### 9.3.1.1 重要觀念：Token 永遠只有「數量」，沒有「內容」
-
-| 來源 | 能拿到 | 拿不到 |
-|---|---|---|
-| `AzureMetrics`（`InputTokens`/`OutputTokens`/`TotalTokens`） | Token **count**（PT1M 聚合，per deployment） | ❌ Token 內容 / ❌ 對應到單筆請求 |
-| `AzureDiagnostics` / `RequestResponse` | requestLength / responseLength（**bytes**，非 token） | ❌ Token count / ❌ 文字內容 |
-| APIM body logging（方案 ①） | prompt 文字、completion 文字、response 內 `usage` block（含 token count） | ⚠️ 256KB 截斷 |
-| APIM `emit-token-metric` policy | 每筆請求的 token **count**（自訂 metric，可帶 dimension） | ❌ Token 內容 |
-
-**Token = tokenizer 切出的 sub-word ID，平台只計算「數量」用於計費。**
-要看「使用者問了什麼 / 模型回了什麼」=「prompt/completion 原始文字」，**只能** 從 request/response body 取得 → 必走方案 ① 或 C（log-to-eventhub）。
-
-### 9.3.2 真正能拿 per-request token 的方案
-
-只剩：
-- **APIM `azure-openai-emit-token-metric` policy** — 官方政策，從 response body parse usage → 發成 custom metric
-  - ⚠️ 對 streaming 仍要 `Body.As<string>(preserveContent:true)` → 同樣踩 R4
-  - ⚠️ 開源模型（Kimi/DeepSeek）的 usage 欄位格式不一定相容
-- **APIM body logging（方案 ①）** — body 內含 usage（如果沒被截）
-- **Client SDK 自行記錄**（方案 B）— 可被繞過，不符治理
-
-### 9.4 決策樹（修正版）
-
-| 需求 | 推薦方案 |
+| 需求 | 推薦 |
 |---|---|
-| Token 計費 / SLA / 異常告警（聚合即可） | **方案 ③** 即可（最便宜、無 R4 風險） |
-| 看完整 prompt/completion 內容 (≤256KB) | **方案 ①**（接受截斷風險） |
-| per-request token 數據 | **方案 ① + APIM emit-token-metric policy** |
-| 完整稽核 + 全文 + 計費 | **方案 ① + 方案 ③ 並存**，未來補方案 C (log-to-eventhub) |
+| 完整 prompt/completion 文字（含 >256KB / streaming / reasoning 末尾） | **方案 C** |
+| 中等流量 + body 通常 <256KB + 即時 KQL 查詢 | 方案 ① |
+| 完整稽核 + 即時告警 + 計費 | **方案 ① + 方案 C 並存**（A/B by header） |
+| 計費聚合（per deployment） | Foundry 內建 `AzureMetrics`（不需任何方案，免費） |
 
 ### 9.5 驗證流程
 
-1. 部署方案 ③：`.\scripts\deploy-foundry-diag.ps1`
-2. 跑 `test-solution3-foundry-diag.ipynb` TC-07 a/b/c（每筆帶 `RUN_ID`）
-3. 方案 ③ LAW 用 `queries-foundry-diag.kql` F2/F7 驗證 token
-4. 方案 ① LAW 用 `queries.kql` 看 body
-5. 並排比較用 `queries-comparison.kql` C1/C2/C3
+1. 部署方案 C：`.\scripts\deploy-eventhub-logging.ps1`
+2. 套用政策：`.\scripts\apply-eventhub-policy.ps1 -ApiName kunlenewfoundry01`
+3. 跑 `notebooks/test-solution-c-eventhub.ipynb` TC-C1~C4（4 個 case，含對照組）
+4. 等 5 分鐘 Capture 觸發 → notebook 自動下載最新 Avro，用 `fastavro` 解析驗證 marker 都在
+5. 對照方案 ①：同一個 `RUN_ID` 也要在 AppInsights `AppDependencies` 找得到 → 證明雙軌獨立並行
+
+### 9.6 為何移除方案 ③（補充說明）
+
+> 經實測 + 官方文件確認：
+> - [Supported log categories - Microsoft.CognitiveServices/accounts](https://learn.microsoft.com/azure/azure-monitor/reference/supported-logs/microsoft-cognitiveservices-accounts-logs) 顯示 `RequestResponse` 為 platform 操作日誌（含 `apiName`/`requestLength`/`responseLength`/`requestTime`/`responseTime`/`objectId`），**未列出任何 token 或 body 欄位**
+> - [Monitoring data reference for Azure OpenAI](https://learn.microsoft.com/azure/ai-foundry/openai/monitor-openai-reference) 確認 `InputTokens`/`OutputTokens`/`TotalTokens` 為 platform metrics，時間粒度 PT1M，dimension `ModelDeploymentName`
+> - [`azure-openai-emit-token-metric` policy](https://learn.microsoft.com/azure/api-management/azure-openai-emit-token-metric-policy) 官方明示 per-request token 必須由 APIM policy 從 body parse
+>
+> **結論**：方案 ③ 提供的能力（聚合 token / metadata / 控制平面 audit）本實驗不需要，且其 ✅ 項目都被「方案 ① + Foundry 內建 AzureMetrics」涵蓋，故不再保留以避免混淆。
+
 
 ---
 
