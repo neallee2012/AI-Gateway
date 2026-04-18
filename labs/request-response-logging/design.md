@@ -146,11 +146,25 @@ resource apiDiagnostics 'Microsoft.ApiManagement/service/apis/diagnostics@2024-0
 
 Trace 會寫入 App Insights 的 `traces` 表格。
 
-### 4.3 Streaming 支援
+### 4.3 Streaming 支援與限制
 
-- Built-in LLM Logging 在 2024-05 之後已支援 SSE，會等整段回應結束後記錄完整內容
+- Built-in LLM Logging 在 2024-05 之後已支援 SSE，會把 raw SSE chunks 寫入 `Response-Body`
 - `estimate-prompt-tokens="true"` 確保 inbound 估算 token
-- outbound 若需切片記錄，可加 `<set-header>` 禁用壓縮並用 `<trace>` 記錄原始 chunk
+
+#### ⚠️ 已知限制：256KB 截斷
+
+- `largeLanguageModel.responses.maxSizeInBytes` 上限為 **262144 bytes (256 KB)**，這是 Azure 硬限制無法調高
+- Reasoning models（如 Kimi-K2.5、DeepSeek-R1）的 streaming 回應每個 chunk 都帶 `content_filter_results` 等大量 metadata，**容易超過 256KB**
+- 截斷發生時，**最終的 `content`（assistant 回答）通常落在 SSE 流的末段，反而是被丟掉的部分**
+
+#### ✅ 突破 256KB 的方案
+
+| 方案 | 適用場景 | 實作 |
+|------|---------|------|
+| **A. Client 端寫 customEvents** | logging 驗證、開發測試 | Notebook section 6 已實作；用 `opencensus-ext-azure` 直接送 App Insights `AppEvents`，每 property 8KB 但可分多塊 |
+| **B. log-to-eventhub policy** | Production / 大量資料 | 在 outbound 用 `<log-to-eventhub>` 把完整 body 推到 Event Hubs（單訊息 1MB），再 ingest 回 Log Analytics |
+| **C. KQL 重組 raw SSE** | 已有 raw 但要分析 | `kql/queries.kql` Query #9 把 `data: {...}` chunks 拼回 `FullContent`/`FullReasoning`/`Usage`（截斷部分仍會缺） |
+| **D. 改用非 streaming** | 需 100% 完整 | 對重要請求關掉 streaming，content 通常 < 10KB 可完整存下 |
 
 ---
 

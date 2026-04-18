@@ -34,7 +34,7 @@
             <dimension name="Subscription ID" value="@(context.Subscription != null ? context.Subscription.Id : "anonymous")" />
             <dimension name="API ID" value="@(context.Api.Id)" />
             <dimension name="Operation ID" value="@(context.Operation.Id)" />
-            <dimension name="Correlation ID" value="@((string)context.Variables[&quot;correlationId&quot;])" />
+            <dimension name="Correlation ID" value="@((string)context.Variables["correlationId"])" />
         </llm-emit-token-metric>
     </inbound>
 
@@ -57,7 +57,7 @@
         <!-- Trace the response completion (body is auto-captured via diagnostic setting) -->
         <trace source="llm-logging" severity="information">
             <message>@("LLM Response status: " + context.Response.StatusCode)</message>
-            <metadata name="correlationId" value="@((string)context.Variables["correlationId"])" />
+            <metadata name="correlationId" value="@((string)context.Variables.GetValueOrDefault("correlationId", ""))" />
             <metadata name="statusCode" value="@(context.Response.StatusCode.ToString())" />
         </trace>
     </outbound>
@@ -66,7 +66,7 @@
         <base />
         <trace source="llm-logging" severity="error">
             <message>@("LLM Error: " + (context.LastError?.Message ?? "unknown"))</message>
-            <metadata name="correlationId" value="@((string)context.Variables[&quot;correlationId&quot;])" />
+            <metadata name="correlationId" value="@((string)context.Variables["correlationId"])" />
         </trace>
     </on-error>
 </policies>

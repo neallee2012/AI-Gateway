@@ -112,3 +112,56 @@ AppRequests
 | where Name startswith "POST /kunlenewfoundry01"
 | project TimeGenerated, Name, Url, ResultCode, DurationMs, Success, ClientIP
 | order by TimeGenerated desc
+
+
+// -----------------------------------------------------------------------------
+//  ⭐ 9. Streaming 回應 → 把 SSE chunks 重組成完整可讀文字
+// -----------------------------------------------------------------------------
+//  說明：streaming 回應在 Response-Body 是大量 "data: {...}\n\n"，每塊有
+//  delta.content 或 delta.reasoning_content。以下查詢把所有 delta 拼回完整字串。
+//  注意：App Insights diagnostic 上限 256KB，超過會被截斷（IsTruncated=true）。
+// -----------------------------------------------------------------------------
+AppDependencies
+| where TimeGenerated > ago(1h)
+| where Name has "chat/completions" and ResultCode == "200"
+| extend P    = parse_json(tostring(Properties))
+| extend Resp = tostring(P["Response-Body"])
+| where Resp startswith "data:"   // streaming only
+| extend IsTruncated = strlen(Resp) >= 262000
+| extend Lines = split(Resp, "data: ")
+| mv-expand Line = Lines to typeof(string)
+| where isnotempty(Line) and Line != "[DONE]\n\n"
+| extend J = parse_json(trim_end("\n\n", trim(" ", Line)))
+| where isnotnull(J.choices)
+| extend OperationId = OperationId,
+         Content        = tostring(J.choices[0].delta.content),
+         Reasoning      = tostring(J.choices[0].delta.reasoning_content),
+         FinishReason   = tostring(J.choices[0].finish_reason),
+         Usage          = J.usage
+| summarize FullContent   = strcat_array(make_list_if(Content, isnotempty(Content)), ""),
+            FullReasoning = strcat_array(make_list_if(Reasoning, isnotempty(Reasoning)), ""),
+            FinalUsage    = take_anyif(Usage, isnotnull(Usage)),
+            FinishReason  = take_anyif(FinishReason, isnotempty(FinishReason)),
+            IsTruncated   = any(IsTruncated),
+            TimeGenerated = max(TimeGenerated)
+        by OperationId
+| project TimeGenerated, OperationId, IsTruncated, FinishReason,
+          FullContent, FullReasoning,
+          PromptTokens     = toint(FinalUsage.prompt_tokens),
+          CompletionTokens = toint(FinalUsage.completion_tokens),
+          TotalTokens      = toint(FinalUsage.total_tokens)
+| order by TimeGenerated desc
+
+
+// -----------------------------------------------------------------------------
+//  10. 檢查截斷狀況：哪些回應達到 256KB 上限？
+// -----------------------------------------------------------------------------
+AppDependencies
+| where TimeGenerated > ago(24h)
+| where Name has "chat/completions"
+| extend Resp = tostring(parse_json(tostring(Properties))["Response-Body"])
+| extend BodySize = strlen(Resp), IsTruncated = strlen(Resp) >= 262000
+| summarize Calls=count(), Truncated=countif(IsTruncated),
+            AvgSize=avg(BodySize), MaxSize=max(BodySize)
+        by ResultCode
+| extend TruncatedPct = round(100.0 * Truncated / Calls, 1)

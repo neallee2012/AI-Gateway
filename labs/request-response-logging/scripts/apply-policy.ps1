@@ -50,12 +50,19 @@ $tempFile = [System.IO.Path]::GetTempFileName()
 [System.IO.File]::WriteAllText($tempFile, $body, (New-Object System.Text.UTF8Encoding $false))
 
 try {
-    az rest --method put --uri $uri --body "@$tempFile" --headers "Content-Type=application/json"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Failed to apply policy (exit code $LASTEXITCODE)"
-        exit 1
-    }
+    # Use Invoke-RestMethod (more robust than `az rest` which has CP950 codec issues
+    # when handling responses containing non-ASCII or BOM characters on Windows zh-TW)
+    $token = (az account get-access-token --query accessToken -o tsv)
+    if ([string]::IsNullOrEmpty($token)) { throw "Failed to acquire ARM access token" }
+    $fullUri = "https://management.azure.com$uri"
+    $resp = Invoke-RestMethod -Method PUT -Uri $fullUri `
+        -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
+        -Body $body
     Write-Host "Policy applied successfully." -ForegroundColor Green
+} catch {
+    Write-Host "ERROR applying policy:" -ForegroundColor Red
+    Write-Host $_.ErrorDetails.Message
+    throw
 } finally {
     Remove-Item $tempFile -ErrorAction SilentlyContinue
 }
