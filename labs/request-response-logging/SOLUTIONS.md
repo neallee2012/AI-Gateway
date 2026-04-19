@@ -6,16 +6,18 @@
 
 ## TL;DR — 方案最終結論
 
-| # | 方案 | 狀態 | 適用場景 |
-|---|---|---|---|
-| ① | APIM Built-in LLM Logging → App Insights | ✅ **上線** | 一般流量；body ≤ 256KB；非 streaming 為佳 |
-| C | APIM `log-to-eventhub` → Event Hub → Blob Capture (Avro) | ✅ **上線** | 大 body / streaming / 長期歸檔；可 header-keyed 或永遠啟用 |
+中央稽核情境下，方案 1 與方案 2 **二選一**部署（不會雙軌並行；一般不會要求 client 端去寫不同的 header）。
 
-**雙軌並行**：方案 ① 持續記錄所有流量到 App Insights；方案 C 預設只在 client 帶 `X-Logging-Channel: solution-c` header 時額外寫到 Event Hub，**對既有 ① 與一般流量零影響**；若客戶以方案 C 為主要 log 路徑，可改用 always-on 變體（見下方 [客戶部署選項](#客戶部署選項-solution-c-變體)）。
+| # | 方案 | 適用 |
+|---|---|---|
+| 1 | APIM Built-in LLM Logging → App Insights | body 一律 ≤ 256KB、且**不需要**完整記錄 streaming 內容（如純 chat、非 reasoning model） |
+| 2 | APIM `log-to-eventhub` → Event Hub → Blob Capture (Avro) | 任一條件成立：body 可能 > 256KB、需完整記錄 SSE streaming、需長期合規歸檔（>90 天） |
+
+> 本 lab 為了能在同一座 APIM / 同一個 API 上同時驗證、A/B 比對兩個方案，把方案 2 policy 設計成 **header-keyed**（只在 `X-Logging-Channel: solution-c` 時觸發）；這只是 POC 上的便利性，**正式部署不需要 client 帶任何特殊 header**——直接套用 always-on 變體即可（見 [客戶部署選項](#客戶部署選項-solution-c-變體)）。
 
 ---
 
-## 方案 ① — APIM Built-in LLM Logging → App Insights
+## 方案 1 — APIM Built-in LLM Logging → App Insights
 
 ### 機制
 
@@ -55,7 +57,7 @@ API Diagnostic 設定（透過 ARM/Bicep）：
 - 內建 PII 過濾鉤（未啟用，可後續開）
 - 與 App Insights / Workbook / Alert 原生整合
 
-### 限制（驅使方案 C 出現的原因）
+### 限制（驅使方案 2 出現的原因）
 
 | # | 限制 | 影響 |
 |---|---|---|
@@ -71,7 +73,7 @@ API Diagnostic 設定（透過 ARM/Bicep）：
 
 ---
 
-## 方案 C — APIM `log-to-eventhub` → Event Hub → Blob Capture (Avro)
+## 方案 2 — APIM `log-to-eventhub` → Event Hub → Blob Capture (Avro)
 
 ### 機制
 
@@ -80,10 +82,10 @@ Client (帶 X-Logging-Channel: solution-c)
   │
   ▼
 APIM testaigw01 (combined-llm-and-eventhub-policy.xml)
-  ├─ <inbound>  : 方案 ① 照舊（trace + emit-token-metric）
+  ├─ <inbound>  : 方案 1 照舊（trace + emit-token-metric）
   │              + 若 header 命中 → 抓 request body 到 variable
   ├─ <backend>  : <retry> 處理 429/5xx
-  └─ <outbound> : 方案 ① 照舊
+  └─ <outbound> : 方案 1 照舊
                  + 若 header 命中 → 抓 response body 到 variable
                                   → log-to-eventhub × N
                                     （1 個 summary + chunkTotal × {request,response} chunks）
@@ -164,7 +166,7 @@ APIM testaigw01 (combined-llm-and-eventhub-policy.xml)
 - **無 256KB 限制**：自動 chunk，最大 16 × 80,000 = 1.28 MB / request（已驗證 ~1MB streaming response）
 - **完整 streaming**：response body 在 `<outbound>` 已組裝，SSE 全文照寫
 - **長期歸檔**：Blob Capture Avro，配合 ADX external table 可秒級查詢數年資料
-- **Header 隔離**：對既有方案 ① 與一般流量零影響、可指定流量做高保真稽核
+- **Header 隔離**：對既有方案 1 與一般流量零影響、可指定流量做高保真稽核
 - **Retry 可見性**：APIM `<retry>` 每次嘗試都會產 1 組事件，可看到 429 → 200 完整路徑
 - **MSI auth**：APIM 用 user-assigned MI 寫 EH，無金鑰流轉
 
@@ -190,7 +192,7 @@ APIM testaigw01 (combined-llm-and-eventhub-policy.xml)
 | TC | 場景 | 驗證重點 |
 |---|---|---|
 | **C1** | 短 non-streaming | 1 summary + 1/1 request + 1/1 response chunk；token usage 完整 |
-| **C2** | 大 non-streaming（>256KB） | response 拆 ≥ 2 chunk，總長 > Solution ① 截斷點 |
+| **C2** | 大 non-streaming（>256KB） | response 拆 ≥ 2 chunk，總長 > Solution 1 截斷點 |
 | **C3** | streaming SSE | 完整 SSE delta 拼回，含 reasoning_content + content + 最終 usage |
 | **C4** | 控制組（**不**帶 header） | EH 找不到 marker → 證明 header 隔離有效 |
 
@@ -226,29 +228,29 @@ APIM testaigw01 (combined-llm-and-eventhub-policy.xml)
 # 1. 部署 EH + Storage + Logger（idempotent）
 ./scripts/deploy-eventhub-logging.ps1
 
-# 2. 套用 Solution C policy 到指定 API
+# 2. 套用 Solution 2 policy 到指定 API
 ./scripts/apply-eventhub-policy.ps1 -ApiName kunlenewfoundry01
 
-# 3. （需要時）回退到純 Solution ①
+# 3. （需要時）回退到純 Solution 1
 ./scripts/apply-eventhub-policy.ps1 -ApiName kunlenewfoundry01 -Remove
 ```
 
 ---
 
-## 客戶部署選項 (Solution C 變體)
+## 客戶部署選項 (Solution 2 變體)
 
-`X-Logging-Channel: solution-c` header **純粹是隔離機制**（為了不影響方案 ① 與一般生產流量），**不是 Solution C 本身的必要欄位**。如果客戶決定將 Solution C 當作主要 log 路徑、或要對所有流量都套用，可以拿掉 header 閘門。
+中央稽核 = 客戶端**不應**為了 log 而改 header。本 lab 提供的 header-keyed 版只是 POC / A-B 驗證用，**正式環境請直接採用 always-on（變體 A）**；變體 B / C 只是給特殊需求（少量豁免、tier 區隔）做參考，並非建議的預設。
 
 ### 變體比較
 
-| 變體 | Policy 檔 | 觸發條件 | 適用場景 |
+| 變體 | Policy 檔 | 觸發條件 | 用途 |
 |---|---|---|---|
-| **預設（header-keyed）** | `combined-llm-and-eventhub-policy.xml` | 只在 `X-Logging-Channel: solution-c` 時觸發 | POC、A/B、特定流量稽核；不影響既有 ① |
-| **A. 永遠啟用** | `combined-llm-and-eventhub-policy-always-on.xml` | 所有請求一律寫 EH | 客戶把方案 C 當作 primary logging；client 完全不用改 |
-| **B. 反向 opt-out** | （手動編輯 always-on，加 `<choose>` 判斷 `X-Logging-Channel == "off"` 略過） | 預設啟用，特定請求帶 header 關閉 | 大多流量要記、少量內部流量豁免 |
-| **C. Subscription / Product 區隔** | （手動編輯，把 `<when>` 條件換成 `context.Subscription.Id == "..."` 或 `context.Product.Id == "..."`） | 依 subscription / product tier | Enterprise tier 強制稽核、Free tier 不記 |
+| **A. 永遠啟用（建議預設）** | `combined-llm-and-eventhub-policy-always-on.xml` | 所有請求一律寫 EH | **正式中央稽核部署**；client 完全不用改 |
+| header-keyed (POC) | `combined-llm-and-eventhub-policy.xml` | 只在 `X-Logging-Channel: solution-c` 時觸發 | 僅供 lab POC / A-B 驗證 / 與方案 1 並存比對 |
+| B. 反向 opt-out | 從 always-on 手動加 `<choose>` 判斷 `X-Logging-Channel == "off"` 略過 | 預設啟用，特定 client 帶 header 關閉 | 大多流量要記、少量內部 / health-check 流量豁免 |
+| C. Subscription / Product 區隔 | 從 always-on 手動把條件換成 `context.Subscription.Id == "..."` 或 `context.Product.Id == "..."` | 依 subscription / product tier | Enterprise tier 強制稽核、Free tier 不記 |
 
-### 變體 A — 永遠啟用（已附 ready-to-use policy）
+### 變體 A — 永遠啟用（建議預設，已附 ready-to-use policy）
 
 差異點僅 3 處：
 
@@ -298,39 +300,46 @@ APIM testaigw01 (combined-llm-and-eventhub-policy.xml)
 | **D2** | `api-key` header | **必要**。這是 APIM subscription key，做 API auth，與 logging 無關。 |
 | **D3** | 效能影響 | 拿掉 header 隔離後，**所有**請求都跑 1 + 16 + 16 = 33 個 `<log-to-eventhub>` 元素，每個請求多 ~10–30ms latency 與 EH 流量。導入前建議在預期 TPS 下做負載測試。 |
 | **D4** | EH / Storage 成本 | EH throughput unit、Storage Capture 容量會隨流量線性成長。若日均流量 > 100k req，建議改 EH Standard Dedicated 或調 retention 策略。 |
-| **D5** | Solution ① 是否仍要保留 | always-on 變體仍保留 Solution ① 的 `<llm-emit-token-metric>` + 內建 LLM logging。若客戶完全只要方案 C，可進一步把 `<llm-emit-token-metric>` 與 API Diagnostic 的 `largeLanguageModel` 區塊移除以省 App Insights 成本。 |
+| **D5** | 與方案 1 並存？ | always-on 變體**技術上**仍保留 Solution 1 的 `<llm-emit-token-metric>` 與內建 LLM logging，因此會雙寫 EH 與 App Insights。**正式中央稽核建議二選一**：選定方案 2 後，可把 `<llm-emit-token-metric>` 與 API Diagnostic 的 `largeLanguageModel` 區塊移除，避免重複成本與資料分裂。 |
 
 ---
 
-## 雙軌總圖
+## 部署決策圖（二選一）
 
 ```
-                              ┌─ X-Logging-Channel: solution-c ─→ Solution ① + Solution C
-Client ──→ APIM testaigw01 ───┤
-                              └─ (無 header)                  ─→ Solution ① only
+                            ┌── 一般 chat、body < 256KB、無 streaming reasoning ──→ 方案 1
+中央稽核需求 ──→ 評估 body / streaming / 歸檔 ─┤
+                            └── 任一條件命中（>256KB / SSE / >90d 歸檔） ─────→ 方案 2 (always-on)
 
-Solution ① 路徑:
-  APIM ──→ App Insights (LLMRequest/LLMResponse, ≤256KB)
-                       └─→ KQL / Workbook / Alert
+方案 1 路徑:
+  Client ──→ APIM ──→ App Insights (LLMRequest/LLMResponse, ≤256KB)
+                                  └─→ KQL / Workbook / Alert
 
-Solution C 路徑（只在 header 命中時並行寫）:
-  APIM ──→ Event Hub (aigw-llm-logs, MSI)
-              └─→ Blob Capture (Avro, 60s/10MB)
-                    └─→ ADX external table / notebook reassemble by correlationId
+方案 2 路徑（always-on，正式部署）:
+  Client ──→ APIM (combined-llm-and-eventhub-policy-always-on.xml)
+              ├─→ Backend (Foundry / OpenAI)
+              └─→ Event Hub (aigw-llm-logs, MSI)
+                    └─→ Blob Capture (Avro, 60s/10MB)
+                          └─→ ADX external table / notebook reassemble by correlationId
+
+⚠️ 本 lab 為了同時驗證兩個方案，使用 header-keyed 版讓兩條路在同一個 APIM 並存；
+   正式部署不會這樣做——選定其中一個方案套用即可。
 ```
 
 ---
 
-## 何時用哪一個
+## 如何選擇
 
-| 情境 | 建議 |
+回答以下任一題若是 **YES**，請選方案 2；全部 NO，方案 1 即可。
+
+| 問題 | YES → 方案 2 的理由 |
 |---|---|
-| 一般 production 流量稽核 | 方案 ① 即可 |
-| 大 prompt（文件分析、長 context） | 加 `X-Logging-Channel: solution-c` 走方案 C |
-| Streaming reasoning model（Kimi-K2.5、o1/o3、DeepSeek-R1） | 加 header 走方案 C |
-| 長期合規歸檔（>90 天） | 加 header 走方案 C → Blob 永久保存 |
-| 計費聚合 / 容量規劃 | Foundry 內建 `AzureMetrics`（不用任何方案） |
-| Prompt injection 調查 | 兩個都查（① 提供索引、C 提供完整內容） |
+| 是否會出現 prompt + completion 任一邊 > 256KB（含長文件分析、長 context window）？ | 方案 1 會被截斷 |
+| 是否使用 reasoning model（Kimi-K2.5、o1/o3、DeepSeek-R1）或大量 streaming（SSE）？ | 方案 1 只能拿到首封包 |
+| 是否需要將完整對話歸檔 > 90 天（合規 / 法務）？ | App Insights 預設 90 天 retention |
+| 是否需要把對話送進 ADX / Synapse 做大規模分析、向量化、或 fine-tune 資料集？ | Blob Capture 的 Avro 直接可被 ADX external table / Synapse Serverless 查 |
+
+> 計費聚合 / 容量規劃需求另從 Foundry 內建 `AzureMetrics`（**免費**，與兩個方案皆不衝突）取得。
 
 ---
 
@@ -338,11 +347,12 @@ Solution C 路徑（只在 header 命中時並行寫）:
 
 | Commit | 說明 |
 |---|---|
-| `28f236f` | 方案 C 端到端打通（EH Capture + header 隔離） |
+| `28f236f` | 方案 2 端到端打通（EH Capture + header 隔離） |
 | `f65ad3c` | 修正 UTF-8 mojibake（body 抓 byte[] 而非 string） |
 | `9015d7b` | verify_marker 跨 partition 聚合 |
 | `141e156` | **重要**：chunk emit 用 skip-marker JSON 取代空字串（解決 chunk 1+ 不發送的 bug） |
 | `791c8ae` | verify 改先聚合再列印（解決 TC-C3 輸出分散問題） |
 | `9d28994` | verify 處理 APIM `<retry>` 多 attempt 場景 |
 | `f090159` | 加入 SOLUTIONS.md（方案總覽） |
-| _(本次)_ | 加入 always-on policy 變體 + 客戶部署選項章節 |
+| `f458c9b` | 加入 always-on policy 變體 + 客戶部署選項章節 |
+| _(本次)_ | 改寫為「二選一」框架（中央稽核情境下不雙軌並行） |
