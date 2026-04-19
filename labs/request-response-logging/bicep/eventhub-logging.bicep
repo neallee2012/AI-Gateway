@@ -35,10 +35,10 @@ param ehRetentionDays int = 7
 @description('Capture interval seconds (60-900)')
 @minValue(60)
 @maxValue(900)
-param captureIntervalSeconds int = 300
+param captureIntervalSeconds int = 60
 
 @description('Capture size threshold bytes (10MB-500MB)')
-param captureSizeBytes int = 314572800
+param captureSizeBytes int = 10485760
 
 // ------------------
 //  VARIABLES
