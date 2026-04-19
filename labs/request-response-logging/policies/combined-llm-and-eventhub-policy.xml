@@ -29,7 +29,10 @@
       <when condition="@(context.Request.Headers.ContainsKey("X-Logging-Channel") ? context.Request.Headers["X-Logging-Channel"].FirstOrDefault() == "solution-c" : false)">
         <set-variable name="solc-enabled" value="true" />
         <set-variable name="solc-correlation-id" value="@(context.Request.Headers.ContainsKey("X-Run-Id") ? context.Request.Headers["X-Run-Id"].FirstOrDefault() : context.RequestId.ToString())" />
-        <set-variable name="solc-request-body" value="@(context.Request.Body.As<string>(preserveContent: true))" />
+        <set-variable name="solc-request-body" value="@{
+            var bytes = context.Request.Body.As<byte[]>(preserveContent: true);
+            return System.Text.Encoding.UTF8.GetString(bytes);
+        }" />
       </when>
       <otherwise>
         <set-variable name="solc-enabled" value="false" />
@@ -51,7 +54,10 @@
     <!-- ===== Solution C: header-keyed log-to-eventhub =============== -->
     <choose>
       <when condition="@((string)context.Variables.GetValueOrDefault("solc-enabled","false") == "true")">
-        <set-variable name="solc-response-body" value="@(context.Response.Body.As<string>(preserveContent: true))" />
+        <set-variable name="solc-response-body" value="@{
+            var bytes = context.Response.Body.As<byte[]>(preserveContent: true);
+            return System.Text.Encoding.UTF8.GetString(bytes);
+        }" />
         <set-variable name="solc-req-chunks" value="@{
           var s = (string)context.Variables["solc-request-body"] ?? "";
           var n = (int)Math.Ceiling((double)s.Length / 700000);
