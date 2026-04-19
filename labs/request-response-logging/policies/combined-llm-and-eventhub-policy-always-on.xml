@@ -1,0 +1,605 @@
+<!--
+    COMBINED policy: Solution ① (LLM logging) + Solution C (Event Hub, header-keyed)
+    =================================================================================
+    Solution ① portion: unchanged from llm-logging-policy.xml (preserves Solution 1)
+    Solution C portion: ALWAYS ON — every request is logged to Event Hub.
+                        Use this when Solution C is the primary logging path.
+-->
+<policies>
+  <inbound>
+    <base />
+    <set-backend-service backend-id="kunlenewfoundry01" />
+    <set-variable name="correlationId" value="@(Guid.NewGuid().ToString())" />
+    <trace source="llm-logging" severity="information">
+      <message>@("LLM Request: " + context.Request.Url.Path)</message>
+      <metadata name="correlationId" value="@((string)context.Variables["correlationId"])" />
+      <metadata name="subscriptionId" value="@(context.Subscription != null ? context.Subscription.Id : "anonymous")" />
+      <metadata name="apiId" value="@(context.Api.Id)" />
+      <metadata name="operationId" value="@(context.Operation.Id)" />
+      <metadata name="clientIp" value="@(context.Request.IpAddress)" />
+    </trace>
+    <llm-emit-token-metric namespace="llm-logging">
+      <dimension name="Subscription ID" value="@(context.Subscription != null ? context.Subscription.Id : "anonymous")" />
+      <dimension name="API ID" value="@(context.Api.Id)" />
+      <dimension name="Operation ID" value="@(context.Operation.Id)" />
+      <dimension name="Correlation ID" value="@((string)context.Variables["correlationId"])" />
+    </llm-emit-token-metric>
+    <!-- ===== Solution C: ALWAYS ON (no header gate) ================ -->
+    <set-variable name="solc-enabled" value="true" />
+    <set-variable name="solc-correlation-id" value="@(context.Request.Headers.ContainsKey("X-Run-Id") ? context.Request.Headers["X-Run-Id"].FirstOrDefault() : context.RequestId.ToString())" />
+    <set-variable name="solc-request-body" value="@{
+        var bytes = context.Request.Body.As<byte[]>(preserveContent: true);
+        return System.Text.Encoding.UTF8.GetString(bytes);
+    }" />
+  </inbound>
+  <backend>
+    <retry condition="@(context.Response.StatusCode == 429 || context.Response.StatusCode == 503 || context.Response.StatusCode == 504)" count="3" interval="2" delta="2" max-interval="10" first-fast-retry="false">
+      <forward-request buffer-request-body="true" />
+    </retry>
+  </backend>
+  <outbound>
+    <base />
+    <trace source="llm-logging" severity="information">
+      <message>@("LLM Response status: " + context.Response.StatusCode)</message>
+      <metadata name="correlationId" value="@((string)context.Variables.GetValueOrDefault("correlationId", ""))" />
+      <metadata name="statusCode" value="@(context.Response.StatusCode.ToString())" />
+    </trace>
+    <!-- ===== Solution C: ALWAYS ON log-to-eventhub ================ -->
+        <set-variable name="solc-response-body" value="@{
+            var bytes = context.Response.Body.As<byte[]>(preserveContent: true);
+            return System.Text.Encoding.UTF8.GetString(bytes);
+        }" />
+        <set-variable name="solc-req-chunks" value="@{
+          var s = (string)context.Variables["solc-request-body"] ?? "";
+          var n = (int)Math.Ceiling((double)s.Length / 80000);
+          return n == 0 ? 1 : n;
+        }" />
+        <set-variable name="solc-resp-chunks" value="@{
+          var s = (string)context.Variables["solc-response-body"] ?? "";
+          var n = (int)Math.Ceiling((double)s.Length / 80000);
+          return n == 0 ? 1 : n;
+        }" />
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr   = (string)context.Variables["solc-correlation-id"];
+          var reqLen = ((string)context.Variables["solc-request-body"] ?? "").Length;
+          var respLen= ((string)context.Variables["solc-response-body"] ?? "").Length;
+          var meta = new JObject(
+            new JProperty("kind", "summary"),
+            new JProperty("correlationId", corr),
+            new JProperty("timestamp", DateTime.UtcNow.ToString("o")),
+            new JProperty("apiId", context.Api.Id),
+            new JProperty("operation", context.Operation.Id),
+            new JProperty("method", context.Request.Method),
+            new JProperty("url", context.Request.OriginalUrl.ToString()),
+            new JProperty("status", context.Response.StatusCode),
+            new JProperty("durationMs", (long)(DateTime.UtcNow - context.Timestamp).TotalMilliseconds),
+            new JProperty("requestLength", reqLen),
+            new JProperty("responseLength", respLen),
+            new JProperty("requestChunks", (int)context.Variables["solc-req-chunks"]),
+            new JProperty("responseChunks", (int)context.Variables["solc-resp-chunks"]),
+            new JProperty("subscriptionId", context.Subscription?.Id ?? ""),
+            new JProperty("clientIp", context.Request.IpAddress)
+          );
+          return meta.ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var i = 0;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "request-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var i = 0;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "response-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var i = 1;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "request-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var i = 1;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "response-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var i = 2;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "request-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var i = 2;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "response-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var i = 3;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "request-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var i = 3;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "response-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var i = 4;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "request-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var i = 4;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "response-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var i = 5;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "request-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var i = 5;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "response-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var i = 6;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "request-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var i = 6;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "response-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var i = 7;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "request-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var i = 7;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "response-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var i = 8;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "request-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var i = 8;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "response-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var i = 9;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "request-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var i = 9;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "response-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var i = 10;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "request-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var i = 10;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "response-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var i = 11;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "request-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var i = 11;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "response-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var i = 12;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "request-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var i = 12;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "response-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var i = 13;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "request-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var i = 13;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "response-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var i = 14;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "request-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var i = 14;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "response-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-request-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-req-chunks"];
+          var i = 15;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "request-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+        <log-to-eventhub logger-id="eh-logger-solutionc">@{
+          var corr = (string)context.Variables["solc-correlation-id"];
+          var body = (string)context.Variables["solc-response-body"] ?? "";
+          var size = 80000;
+          var total = (int)context.Variables["solc-resp-chunks"];
+          var i = 15;
+          if (i >= total) { return "{\"kind\":\"skip\"}"; }
+          var chunk = body.Substring(i*size, Math.Min(size, body.Length - i*size));
+          return new JObject(
+            new JProperty("kind", "response-body"),
+            new JProperty("correlationId", corr),
+            new JProperty("chunkIndex", i),
+            new JProperty("chunkTotal", total),
+            new JProperty("payload", chunk)
+          ).ToString(Newtonsoft.Json.Formatting.None);
+        }</log-to-eventhub>
+  </outbound>
+  <on-error>
+    <base />
+    <trace source="llm-logging" severity="error">
+      <message>@("LLM Error: " + (context.LastError?.Message ?? "unknown"))</message>
+      <metadata name="correlationId" value="@((string)context.Variables["correlationId"])" />
+    </trace>
+  </on-error>
+</policies>

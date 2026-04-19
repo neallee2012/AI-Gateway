@@ -9,10 +9,9 @@
 | # | 方案 | 狀態 | 適用場景 |
 |---|---|---|---|
 | ① | APIM Built-in LLM Logging → App Insights | ✅ **上線** | 一般流量；body ≤ 256KB；非 streaming 為佳 |
-| ③ | Foundry Diagnostic Setting → Log Analytics | ❌ **已移除** | （只有 token count，不含內容；對稽核無價值） |
-| C | APIM `log-to-eventhub` → Event Hub → Blob Capture (Avro) | ✅ **上線（header-keyed）** | 大 body / streaming / 長期歸檔；header 隔離不影響 ① |
+| C | APIM `log-to-eventhub` → Event Hub → Blob Capture (Avro) | ✅ **上線** | 大 body / streaming / 長期歸檔；可 header-keyed 或永遠啟用 |
 
-**雙軌並行**：方案 ① 持續記錄所有流量到 App Insights；方案 C 只在 client 帶 `X-Logging-Channel: solution-c` header 時額外寫到 Event Hub，**對既有 ① 與一般流量零影響**。
+**雙軌並行**：方案 ① 持續記錄所有流量到 App Insights；方案 C 預設只在 client 帶 `X-Logging-Channel: solution-c` header 時額外寫到 Event Hub，**對既有 ① 與一般流量零影響**；若客戶以方案 C 為主要 log 路徑，可改用 always-on 變體（見下方 [客戶部署選項](#客戶部署選項-solution-c-變體)）。
 
 ---
 
@@ -69,29 +68,6 @@ API Diagnostic 設定（透過 ARM/Bicep）：
 ### 驗證
 
 `labs/request-response-logging/notebooks/test-logging.ipynb` — 跑 5 個 TC，KQL 查詢結果寫在 cell output。
-
----
-
-## 方案 ③（已移除）— Foundry Diagnostic Setting
-
-> **⚠️ 已從 lab 拔除（commit `6088a6f`）**
-
-### 為什麼曾考慮
-
-Microsoft.CognitiveServices/accounts 支援 Diagnostic Setting → Log Analytics，看似可以「直接從 Foundry 拿日誌」。
-
-### 為什麼放棄（commit `4099ca9`）
-
-| 項目 | 實況 |
-|---|---|
-| 表 `AzureDiagnostics` 內容 | 只有 HTTP metadata（URL / status / 延遲），**沒有 prompt / completion 文字** |
-| 表 `AzureMetrics` 內容 | 只有 token **數量**（`processed_prompt_tokens` / `generated_completion_tokens`） |
-| 適用場景 | 計費聚合 / 容量規劃 / 健康監控 |
-| **不適用** | 內容稽核、Prompt 漏洞調查、合規 |
-
-→ 對「企業中央稽核 = 看到完整對話內容」這個目標毫無幫助，留著反而誤導。
-
-→ 計費聚合需求另用 Foundry 內建 `AzureMetrics`（**免費**、不需任何方案）。
 
 ---
 
@@ -259,6 +235,73 @@ APIM testaigw01 (combined-llm-and-eventhub-policy.xml)
 
 ---
 
+## 客戶部署選項 (Solution C 變體)
+
+`X-Logging-Channel: solution-c` header **純粹是隔離機制**（為了不影響方案 ① 與一般生產流量），**不是 Solution C 本身的必要欄位**。如果客戶決定將 Solution C 當作主要 log 路徑、或要對所有流量都套用，可以拿掉 header 閘門。
+
+### 變體比較
+
+| 變體 | Policy 檔 | 觸發條件 | 適用場景 |
+|---|---|---|---|
+| **預設（header-keyed）** | `combined-llm-and-eventhub-policy.xml` | 只在 `X-Logging-Channel: solution-c` 時觸發 | POC、A/B、特定流量稽核；不影響既有 ① |
+| **A. 永遠啟用** | `combined-llm-and-eventhub-policy-always-on.xml` | 所有請求一律寫 EH | 客戶把方案 C 當作 primary logging；client 完全不用改 |
+| **B. 反向 opt-out** | （手動編輯 always-on，加 `<choose>` 判斷 `X-Logging-Channel == "off"` 略過） | 預設啟用，特定請求帶 header 關閉 | 大多流量要記、少量內部流量豁免 |
+| **C. Subscription / Product 區隔** | （手動編輯，把 `<when>` 條件換成 `context.Subscription.Id == "..."` 或 `context.Product.Id == "..."`） | 依 subscription / product tier | Enterprise tier 強制稽核、Free tier 不記 |
+
+### 變體 A — 永遠啟用（已附 ready-to-use policy）
+
+差異點僅 3 處：
+
+1. `<inbound>` 拿掉 `<choose>/<when>...X-Logging-Channel...`，直接無條件設 `solc-enabled=true` 與抓 request body
+2. `<outbound>` 拿掉 `<choose>/<when>...solc-enabled=="true"...` 外殼，內部 emit 邏輯不變
+3. 頂端註解標示為 "ALWAYS ON — every request is logged to Event Hub"
+
+套用方式：
+
+```powershell
+# 將 always-on 變體套到指定 API
+./scripts/apply-eventhub-policy.ps1 -ApiName <api-id> -PolicyFile policies/combined-llm-and-eventhub-policy-always-on.xml
+```
+
+> ⚠️ `apply-eventhub-policy.ps1` 預設讀 `combined-llm-and-eventhub-policy.xml`；若 script 未支援 `-PolicyFile` 參數，可手動把 `$policyPath` 指到 always-on 檔，或在 portal 直接貼上。
+
+### 變體 B / C 動手提示
+
+從 always-on 版本起步：
+
+```xml
+<!-- 變體 B：預設啟用，header 為 "off" 時略過 -->
+<choose>
+  <when condition="@(context.Request.Headers.ContainsKey("X-Logging-Channel")
+                   && context.Request.Headers["X-Logging-Channel"].FirstOrDefault() == "off")">
+    <set-variable name="solc-enabled" value="false" />
+  </when>
+  <otherwise>
+    <set-variable name="solc-enabled" value="true" />
+    <!-- 抓 request body 等原有邏輯 -->
+  </otherwise>
+</choose>
+
+<!-- 變體 C：依 subscription / product 區隔 -->
+<when condition="@(context.Product != null && context.Product.Id == "enterprise")">
+  ...
+</when>
+```
+
+注意：變體 B/C 仍要**保留**原始 always-on 變體的 `<outbound>` 「無 `<choose>` 包裹」的展開（或恢復 `<choose>` 包裹但條件檢查 `solc-enabled` 變數），否則 emit 不會觸發。
+
+### 客戶採用變體 A 的相依條件
+
+| # | 項目 | 說明 |
+|---|---|---|
+| **D1** | `X-Run-Id` header | **不必要**。沒帶會 fallback 到 `context.RequestId`；客戶若要事後跨系統 join chunk 仍建議帶。 |
+| **D2** | `api-key` header | **必要**。這是 APIM subscription key，做 API auth，與 logging 無關。 |
+| **D3** | 效能影響 | 拿掉 header 隔離後，**所有**請求都跑 1 + 16 + 16 = 33 個 `<log-to-eventhub>` 元素，每個請求多 ~10–30ms latency 與 EH 流量。導入前建議在預期 TPS 下做負載測試。 |
+| **D4** | EH / Storage 成本 | EH throughput unit、Storage Capture 容量會隨流量線性成長。若日均流量 > 100k req，建議改 EH Standard Dedicated 或調 retention 策略。 |
+| **D5** | Solution ① 是否仍要保留 | always-on 變體仍保留 Solution ① 的 `<llm-emit-token-metric>` + 內建 LLM logging。若客戶完全只要方案 C，可進一步把 `<llm-emit-token-metric>` 與 API Diagnostic 的 `largeLanguageModel` 區塊移除以省 App Insights 成本。 |
+
+---
+
 ## 雙軌總圖
 
 ```
@@ -295,10 +338,11 @@ Solution C 路徑（只在 header 命中時並行寫）:
 
 | Commit | 說明 |
 |---|---|
-| `6088a6f` | 移除方案 ③，加入方案 C 骨架 |
 | `28f236f` | 方案 C 端到端打通（EH Capture + header 隔離） |
 | `f65ad3c` | 修正 UTF-8 mojibake（body 抓 byte[] 而非 string） |
 | `9015d7b` | verify_marker 跨 partition 聚合 |
 | `141e156` | **重要**：chunk emit 用 skip-marker JSON 取代空字串（解決 chunk 1+ 不發送的 bug） |
 | `791c8ae` | verify 改先聚合再列印（解決 TC-C3 輸出分散問題） |
 | `9d28994` | verify 處理 APIM `<retry>` 多 attempt 場景 |
+| `f090159` | 加入 SOLUTIONS.md（方案總覽） |
+| _(本次)_ | 加入 always-on policy 變體 + 客戶部署選項章節 |
