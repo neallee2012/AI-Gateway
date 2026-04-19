@@ -61,11 +61,31 @@ API Diagnostic 設定（透過 ARM/Bicep）：
 
 | # | 限制 | 影響 |
 |---|---|---|
-| **R1** | **單筆 message 上限 256KB**（hard cap，無法調高） | 大 prompt / 長 reasoning / 完整文件分析會被截斷 |
+| **R1** | **單筆 message 上限 256KB**（見下方詳細說明） | 大 prompt / 長 reasoning / 完整文件分析會被截斷 |
 | **R2** | App Insights 採樣 / ingestion 延遲（~2 min） | 不適合即時稽核 |
 | **R3** | App Insights retention 預設 90 天 | 長期歸檔需另外搬 |
 | **R4** | **Streaming（SSE）僅記錄首封包** | TC-C3 場景下 reasoning content 完全看不到 |
 | **R5** | 無法選擇性開關 — 全部 API / 全部請求都會寫 | 高流量成本壓力 |
+
+#### R1 為什麼是 256KB？— 三層 cap 疊加，最終 effective ≈ 256KB
+
+APIM Built-in LLM Logging 寫入 App Insights 的路徑上有**三層獨立的容量限制**疊加，導致 effective 上限約 256KB：
+
+| 層 | 設定 / 限制 | 數值 | 來源 |
+|---|---|---|---|
+| **(a) APIM Diagnostic schema** | `largeLanguageModel.logs.messages.maxSizeInBytes` 與 `requests.maxSizeInBytes` 的 **schema 最大允許值** | **262144 bytes (256KB)** per message | [Microsoft.ApiManagement service/diagnostics ARM schema](https://learn.microsoft.com/azure/templates/microsoft.apimanagement/service/apis/diagnostics)；超過此值 ARM 會拒絕 deploy |
+| **(b) 一般 APIM HTTP body diagnostic** | 同 schema 中 `frontend.request.body.bytes` / `backend.request.body.bytes` | 8192 bytes (8KB) | 一般 HTTP diagnostic 的 body 上限是 8KB；LLM block 是專為 AI gateway 放寬的特例（256KB） |
+| **(c) Application Insights ingestion** | 單一 `customDimensions` 欄位 | 約 8–32KB（依 ingestion path） | App Insights 為了避免單筆 row 過大，>32KB 的 string 欄位會被截斷或拆 row |
+
+> **本 lab bicep 已將 (a) 設為 schema 允許的上限 `262144`**（見 [`design.md` L113](./design.md)：`maxSizeInBytes: 262144  // 256 KB`），所以 256KB 是**實際拿得到的最大值**，再大就被 APIM 在送進 logger 前截斷。
+
+額外效應放大「256KB 不夠」的痛點：
+
+1. **「一筆 message」是 prompt 與 completion 各自獨立計算**，不是兩者加總。但長 reasoning / 長文件 prompt 任一邊就可能 > 256KB（GPT-4o `max_tokens=4096` 的 markdown 表格輸出常 ~120KB；Kimi-K2.5 reasoning trace 動輒 > 300KB）。
+2. **Streaming（R4）讓 256KB 形同虛設**：APIM 是在 `<outbound>` 完成時才把 response body 餵給 logger，但 SSE 是 chunked transfer，APIM 只看得到首個封包（往往只有幾百 bytes 的 `chunk = { choices: [{delta: {role: "assistant"}}] }`），後續 delta 完全沒被記錄。實測 332KB streaming 完整對話進到 App Insights 只有 ~200 bytes。
+3. **無法調高**：(a) 是 ARM schema 硬限制，不是 quota，不能透過 support ticket 提升；(c) 是 App Insights 平台級限制。要破這個牆**必須**換 sink（即方案 2：log-to-eventhub → Event Hub Standard 1MB / message → Blob 無上限）。
+
+→ 凡是預期 prompt 或 completion **可能** > 256KB、或使用 streaming reasoning model，請直接走方案 2。
 
 ### 驗證
 
