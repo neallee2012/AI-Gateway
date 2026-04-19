@@ -67,23 +67,25 @@ API Diagnostic 設定（透過 ARM/Bicep）：
 | **R4** | **Streaming（SSE）僅記錄首封包** | TC-C3 場景下 reasoning content 完全看不到 |
 | **R5** | 無法選擇性開關 — 全部 API / 全部請求都會寫 | 高流量成本壓力 |
 
-#### R1 為什麼是 256KB？— 三層 cap 疊加，最終 effective ≈ 256KB
+#### R1 為什麼是 256KB？— APIM 上限剛好對齊 Log Analytics dynamic 欄位上限
 
-APIM Built-in LLM Logging 寫入 App Insights 的路徑上有**三層獨立的容量限制**疊加，導致 effective 上限約 256KB：
+APIM Built-in LLM Logging 的 256KB 上限**不是任意挑的**，而是為了**剛好塞進 Log Analytics 一筆 record 的 `dynamic` 欄位**。整條鏈的 cap 如下：
 
 | 層 | 設定 / 限制 | 數值 | 來源 |
 |---|---|---|---|
-| **(a) APIM Diagnostic schema** | `largeLanguageModel.logs.messages.maxSizeInBytes` 與 `requests.maxSizeInBytes` 的 **schema 最大允許值** | **262144 bytes (256KB)** per message | [Microsoft.ApiManagement service/diagnostics ARM schema](https://learn.microsoft.com/azure/templates/microsoft.apimanagement/service/apis/diagnostics)；超過此值 ARM 會拒絕 deploy |
-| **(b) 一般 APIM HTTP body diagnostic** | 同 schema 中 `frontend.request.body.bytes` / `backend.request.body.bytes` | 8192 bytes (8KB) | 一般 HTTP diagnostic 的 body 上限是 8KB；LLM block 是專為 AI gateway 放寬的特例（256KB） |
-| **(c) Application Insights ingestion** | 單一 `customDimensions` 欄位 | 約 8–32KB（依 ingestion path） | App Insights 為了避免單筆 row 過大，>32KB 的 string 欄位會被截斷或拆 row |
+| **(a) Log Analytics workspace 欄位上限** ⭐ 真正的瓶頸 | 每筆 record 中 `dynamic` 欄位（JSON 型，如 `customDimensions` / 自訂 schema）最大值 | **256 KB** per dynamic column | [Azure Monitor Logs — Field, record and table limits](https://learn.microsoft.com/azure/azure-monitor/logs/logs-fields#limits)；同表 `string` 欄位上限 32 KB；單筆 record 全部欄位合計 1 MB |
+| **(b) APIM Diagnostic schema** | `largeLanguageModel.logs.messages.maxSizeInBytes` 與 `requests.maxSizeInBytes` 的 default 與 schema 最大允許值 | **262144 bytes (256 KB)** per message | [Microsoft.ApiManagement/service/diagnostics ARM schema](https://learn.microsoft.com/azure/templates/microsoft.apimanagement/service/apis/diagnostics) — APIM team **刻意選 262144 對齊 LAW dynamic 欄位上限**，超過此值 ARM 直接拒收 |
+| **(c) 一般 APIM HTTP body diagnostic** | `frontend.request.body.bytes` / `backend.request.body.bytes` | 8192 bytes (8 KB) | 一般 HTTP diagnostic 的 body 上限只有 8KB；LLM block 是 AI gateway 特例放寬到 256KB（仍受 (a) 約束） |
 
-> **本 lab bicep 已將 (a) 設為 schema 允許的上限 `262144`**（見 [`design.md` L113](./design.md)：`maxSizeInBytes: 262144  // 256 KB`），所以 256KB 是**實際拿得到的最大值**，再大就被 APIM 在送進 logger 前截斷。
+> **本 lab 的 bicep 已將 (b) 設到上限 `262144`**（[`design.md` L113](./design.md)：`maxSizeInBytes: 262144  // 256 KB`），所以 256KB 是**實際拿得到、且能完整落到 LAW 的最大值**。
+>
+> 換句話說：(a) 才是真正的天花板；APIM (b) 的 schema 只是被動配合 (a) 的硬限制。即使未來 APIM 放寬 (b)，沒先打破 LAW (a) 也用不到。
 
 額外效應放大「256KB 不夠」的痛點：
 
 1. **「一筆 message」是 prompt 與 completion 各自獨立計算**，不是兩者加總。但長 reasoning / 長文件 prompt 任一邊就可能 > 256KB（GPT-4o `max_tokens=4096` 的 markdown 表格輸出常 ~120KB；Kimi-K2.5 reasoning trace 動輒 > 300KB）。
 2. **Streaming（R4）讓 256KB 形同虛設**：APIM 是在 `<outbound>` 完成時才把 response body 餵給 logger，但 SSE 是 chunked transfer，APIM 只看得到首個封包（往往只有幾百 bytes 的 `chunk = { choices: [{delta: {role: "assistant"}}] }`），後續 delta 完全沒被記錄。實測 332KB streaming 完整對話進到 App Insights 只有 ~200 bytes。
-3. **無法調高**：(a) 是 ARM schema 硬限制，不是 quota，不能透過 support ticket 提升；(c) 是 App Insights 平台級限制。要破這個牆**必須**換 sink（即方案 2：log-to-eventhub → Event Hub Standard 1MB / message → Blob 無上限）。
+3. **無法調高**：(a) 是 Log Analytics 平台級硬限制（不是 quota，無法開 ticket 提升），(b) 自然也跟著鎖死。要破這個牆**必須**換 sink（即方案 2：log-to-eventhub → Event Hub Standard 1MB / message → Blob 無上限）。
 
 → 凡是預期 prompt 或 completion **可能** > 256KB、或使用 streaming reasoning model，請直接走方案 2。
 
