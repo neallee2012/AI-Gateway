@@ -38,9 +38,17 @@
 | Log Analytics Workspace | ❌ RG 中無現有資源 | **需新建** |
 | Application Insights | ❌ RG 中無現有資源 | **需新建** |
 
-## 📐 設計文件
+## 📐 文件導覽
 
-詳見 [`design.md`](design.md) — 完整架構、Policy 設計、資料流程、KQL 查詢範例。
+| 文件 | 用途 |
+|---|---|
+| [`DECISION.md`](DECISION.md) ⭐ | **一頁式方案選擇決策** — 結論、為什麼選 1B、部署檢核表 |
+| [`SOLUTIONS.md`](SOLUTIONS.md) | 三方案完整技術細節、policy 範例、KQL、限制與血淚教訓 |
+| [`design.md`](design.md) | 原始架構設計（含資料流程、KQL 範例） |
+| [`notebooks/test-solution-1b-llmlogs.ipynb`](notebooks/test-solution-1b-llmlogs.ipynb) | 方案 1B（首選）端到端驗證 — 5 TC |
+| [`notebooks/test-solution-c-eventhub.ipynb`](notebooks/test-solution-c-eventhub.ipynb) | 方案 2 驗證（POC 用） |
+
+> **目前首選方案：1B — APIM Built-in LLM Logging → Azure Monitor logger → Log Analytics `ApiManagementGatewayLlmLog`**。詳見 [`DECISION.md`](DECISION.md)。
 
 ## 📂 資料夾結構
 
