@@ -6,18 +6,19 @@
 
 ## TL;DR — 方案最終結論
 
-中央稽核情境下，方案 1 與方案 2 **二選一**部署（不會雙軌並行；一般不會要求 client 端去寫不同的 header）。
+中央稽核情境下，三個方案**三選一**部署（不會多軌並行；一般不會要求 client 端去寫不同的 header）。**新發現方案 1B 是現在的首選**，因 V1 實測證明它能**完整重組 streaming SSE**，可同時取代我們最早的方案 1 與多數方案 2 場景。
 
 | # | 方案 | 適用 |
 |---|---|---|
-| 1 | APIM Built-in LLM Logging → App Insights | body 一律 ≤ 256KB、且**不需要**完整記錄 streaming 內容（如純 chat、非 reasoning model） |
-| 2 | APIM `log-to-eventhub` → Event Hub → Blob Capture (Avro) | 任一條件成立：body 可能 > 256KB、需完整記錄 SSE streaming、需長期合規歸檔（>90 天） |
+| 1A | APIM Built-in LLM Logging（**App Insights** logger）→ `dependencies` table | （**legacy / 不再建議**）保留原因：歷史資料、現有 Workbook；body ≤ 256KB；streaming 只記首封包 |
+| **1B** | APIM Built-in LLM Logging（**Azure Monitor** logger）→ LAW `ApiManagementGatewayLlmLog` 表 | ⭐ **大多數中央稽核情境的首選**。原生 chunk + `SequenceNumber` 重組、原生 `IsStreamCompletion`、單筆 message 上限 **2 MB**、**streaming SSE 自動重組為完整 assistant content**（V1 已實測）；零 policy code |
+| 2 | APIM `log-to-eventhub` → Event Hub → Blob Capture (Avro) | 任一條件成立才需要：單條 message 可能 > 2 MB、需離開 LAW（直進 ADX/Synapse）、需 > LAW 最大 retention（永久 Blob 歸檔）、或需自訂 sink 與 schema |
 
-> 本 lab 為了能在同一座 APIM / 同一個 API 上同時驗證、A/B 比對兩個方案，把方案 2 policy 設計成 **header-keyed**（只在 `X-Logging-Channel: solution-c` 時觸發）；這只是 POC 上的便利性，**正式部署不需要 client 帶任何特殊 header**——直接套用 always-on 變體即可（見 [客戶部署選項](#客戶部署選項-solution-c-變體)）。
+> 本 lab 為了能在同一座 APIM / 同一個 API 上同時驗證、A/B 比對方案 2，把方案 2 policy 設計成 **header-keyed**（只在 `X-Logging-Channel: solution-c` 時觸發）；這只是 POC 上的便利性，**正式部署不需要 client 帶任何特殊 header**——直接套用 always-on 變體即可（見 [客戶部署選項](#客戶部署選項-solution-c-變體)）。
 
 ---
 
-## 方案 1 — APIM Built-in LLM Logging → App Insights
+## 方案 1A — APIM Built-in LLM Logging → App Insights（legacy）
 
 ### 機制
 
@@ -57,15 +58,17 @@ API Diagnostic 設定（透過 ARM/Bicep）：
 - 內建 PII 過濾鉤（未啟用，可後續開）
 - 與 App Insights / Workbook / Alert 原生整合
 
-### 限制（驅使方案 2 出現的原因）
+### 限制（驅使方案 1B / 方案 2 出現的原因）
 
 | # | 限制 | 影響 |
 |---|---|---|
 | **R1** | **單筆 message 上限 256KB**（見下方詳細說明） | 大 prompt / 長 reasoning / 完整文件分析會被截斷 |
 | **R2** | App Insights 採樣 / ingestion 延遲（~2 min） | 不適合即時稽核 |
 | **R3** | App Insights retention 預設 90 天 | 長期歸檔需另外搬 |
-| **R4** | **Streaming（SSE）僅記錄首封包** | TC-C3 場景下 reasoning content 完全看不到 |
+| **R4** | **Streaming（SSE）僅記錄首封包** | TC-C3 場景下 reasoning content 完全看不到（V1 實測 1A 路徑只有 ~200 bytes） |
 | **R5** | 無法選擇性開關 — 全部 API / 全部請求都會寫 | 高流量成本壓力 |
+
+> **R1、R4 已被方案 1B（GatewayLlmLogs）解決**：原生 chunk + SequenceNumber 把單筆 cap 提到 2 MB；streaming SSE 在 logger 端被自動重組為完整 assistant message。所以**新部署直接選方案 1B**；方案 1A 只剩下「歷史資料 / 既有 Workbook 鎖定 App Insights」的場景。
 
 #### R1 為什麼是 256KB？— APIM 上限剛好對齊 Log Analytics dynamic 欄位上限
 
@@ -92,6 +95,103 @@ APIM Built-in LLM Logging 的 256KB 上限**不是任意挑的**，而是為了*
 ### 驗證
 
 `labs/request-response-logging/notebooks/test-logging.ipynb` — 跑 5 個 TC，KQL 查詢結果寫在 cell output。
+
+---
+
+## 方案 1B ⭐ — APIM Built-in LLM Logging → LAW `ApiManagementGatewayLlmLog`
+
+### 機制
+
+APIM **API-level Diagnostic** 改用 **`azuremonitor` logger**（不是 `applicationinsights`），LLM logs 走 APIM Resource Log → LAW 專屬表 `ApiManagementGatewayLlmLog`（dedicated mode）或 `AzureDiagnostics where Category=="GatewayLlmLogs"`（legacy mode）。
+
+```
+Client → APIM API (azuremonitor diagnostic, largeLanguageModel.logs=enabled)
+                ↓
+        APIM Resource Log: GatewayLlmLogs
+                ↓
+        Diagnostic Settings → Log Analytics Workspace
+                ↓
+        ApiManagementGatewayLlmLog table（多筆 row：seq=0 metadata, seq=1 request, seq≥2 response chunks）
+                ↓
+        KQL 用 CorrelationId + SequenceNumber 重組
+```
+
+### 啟用步驟（3 步）
+
+1. **Service-level Diagnostic Setting**（已存在的 `apim-to-log-analytics` 已涵蓋；建議切到 **Resource specific (Dedicated) destination type**，不要用 AzureDiagnostics legacy mode）：
+   ```bash
+   az monitor diagnostic-settings create \
+     --name apim-to-law \
+     --resource <APIM_RESOURCE_ID> \
+     --workspace <LAW_RESOURCE_ID> \
+     --logs '[{"categoryGroup":"allLogs","enabled":true}]' \
+     --export-to-resource-specific true
+   ```
+
+2. **API-level Diagnostic**（每個要記錄的 API 設一次）：
+   ```bash
+   az rest --method put \
+     --uri "https://management.azure.com/<APIM_ID>/apis/<API_ID>/diagnostics/azuremonitor?api-version=2024-05-01" \
+     --body '{"properties":{"loggerId":"<APIM_ID>/loggers/azuremonitor","alwaysLog":"allErrors","logClientIp":true,"verbosity":"information","largeLanguageModel":{"logs":"enabled","requests":{"messages":"all","maxSizeInBytes":32768},"responses":{"messages":"all","maxSizeInBytes":32768}}}}'
+   ```
+   `azuremonitor` logger 不需事先建立，APIM 預設就有。
+
+3. **Portal 等價路徑**（同事截圖看到的就是這個）：API > Settings > **Azure Monitor** tab → "Log LLM messages: Enabled" → 勾 Log prompts 與 Log completions，各設大小（如 32768 bytes）。
+
+### 容量規格（vs 方案 1A）
+
+| 項目 | 方案 1A | **方案 1B** | 來源 |
+|---|---|---|---|
+| 單筆 entry 上限 | 256 KB | 32 KB（dedicated mode 自動 split） | [Set up logging for LLM APIs](https://learn.microsoft.com/azure/api-management/api-management-howto-llm-logs) |
+| 跨筆重組 | 無 | ✅ `CorrelationId` + `SequenceNumber` | 同上 |
+| **單條 message 全長硬上限** | 256 KB | **2 MB per request、2 MB per response** | 同上："Request messages and response messages can't exceed 2 MB each" |
+| Streaming SSE | 只首封包（R4） | ✅ **完整重組為 assistant message** | V1 實測（見下） |
+| Token usage 欄位 | App Insights customMetrics | 表內原生 `PromptTokens` / `CompletionTokens` / `TotalTokens` 欄位 | Schema |
+| Stream 標記 | 無 | 表內 `IsStreamCompletion` bool 欄位 | Schema |
+| Model / Deployment | 散在 customDimensions | 表內 `ModelName` / `DeploymentName` 欄位 | Schema |
+| Sink | App Insights `dependencies.customDimensions` | LAW 專屬表 | — |
+| Retention | App Insights 預設 90 天 | LAW 預設 30 天，可調至 730 天 | LAW 設定 |
+
+### V1 驗證結果（2026-04-20，testaigw01 / kunlenewfoundry01）
+
+設置：把 `azuremonitor` diagnostic 加到 `kunlenewfoundry01` API（`maxSizeInBytes=32768`），跑兩個請求，等 ~3 分鐘 ingest，查 LAW。
+
+| 場景 | CorrelationId | rows | SequenceNumber 分布 | isStream | completion tokens | response 內容驗證 |
+|---|---|---|---|---|---|---|
+| **V1A 失敗 case**（429 從 Foundry concurrent capacity） | `8a73...b964` | 2 | 0 (metadata) + 1 (request) | false | 0 | 失敗時無 response row，但 request 已記 |
+| **V1A2 大 non-streaming**（5031-byte response） | `75f8...ee79` | 4 | 0 + 1 + **2 (15000 chars) + 3 (2486 chars)** | false | 3500 | ✅ **chunking 成功**：seq 2 被截在中文 `\u` escape 中段，seq 3 從中間接續、結尾 `}` 完整。重組後 17486 chars 為完整 JSON message |
+| **V1B Streaming SSE**（583,931-byte raw SSE） | `38d3...7623` | 3 | 0 + 1 + 2 (3966 chars) | **true** | 3000 | ✅ **streaming 完整重組**：seq 2 內容是 `{"role":"assistant","content":" Azure SQL ... ## Application Gateway ... Regional Load Balancer"}`，是 APIM 在 logger 端把 SSE delta 串起來後寫入的完整 assistant message。3000 token Chinese 約 4000 chars，吻合 |
+
+> **關鍵發現**：raw SSE 583 KB 看起來嚇人，但其中 ~98% 是每 token 都重複的 `data: {"choices":[{"delta":{...}}]}\n\n` SSE wrapper；APIM logger 在 outbound 端**已經自動把 delta 拼回 assistant content**才寫入 `responseMessages`，所以 LAW 拿到的是去除 SSE 框架後的乾淨對話。這跟 1A 路徑的行為完全不同，是 GatewayLlmLogs 最有價值的差異。
+
+### KQL 重組範例（dedicated mode）
+
+```kusto
+ApiManagementGatewayLlmLog
+| where TimeGenerated > ago(1h)
+| extend ReqJson  = tostring(RequestMessages),
+         RespJson = tostring(ResponseMessages)
+| summarize
+    Model         = anyif(ModelName, isnotempty(ModelName)),
+    IsStream      = anyif(IsStreamCompletion, isnotnull(IsStreamCompletion)),
+    PromptTokens  = anyif(PromptTokens, PromptTokens > 0),
+    CompletionTok = anyif(CompletionTokens, CompletionTokens > 0),
+    Request       = strcat_array(make_list(ReqJson),  ""),
+    Response      = strcat_array(make_list(RespJson), "")
+  by CorrelationId
+| project CorrelationId, Model, IsStream, PromptTokens, CompletionTok,
+          ReqLen=strlen(Request), RespLen=strlen(Response), Request, Response
+```
+
+### 限制 / 注意事項
+
+| # | 項目 | 說明 |
+|---|---|---|
+| **G1** | 單條 message 硬上限 **2 MB** | 比 1A 的 256 KB 大 8 倍；99% LLM 對話都夠用。超過時溢位部分被丟棄（不報錯） |
+| **G2** | LAW 計費按 ingested GB | chunk 多 → row 數多，但因為 logger 端已去除 SSE wrapper，實際 ingest bytes 比 raw SSE 小 ~50× |
+| **G3** | Diagnostic Settings 必須選 **Resource specific (Dedicated)** destination type | 才會落到 `ApiManagementGatewayLlmLog`；legacy `AzureDiagnostics` mode 也能用，但欄位都是 `_s` 後綴、且 string 欄位被截在 ~15000 chars 而不是 32 KB（V1 實測） |
+| **G4** | Retry 行為 | APIM `<retry>` 每個 attempt 產一組獨立 CorrelationId（V1 觀察到 V1A 一筆失敗的 8a73 與 V1A2 成功的 75f8 是不同 CorrelationId） |
+| **G5** | API-level diagnostic 必須**額外**設 `azuremonitor` 一份 | 跟現有 `applicationinsights` diagnostic 共存（不衝突）。若客戶選定 1B，可移除 `applicationinsights` diagnostic 與 logger 以省 App Insights 成本 |
 
 ---
 
@@ -326,42 +426,53 @@ APIM testaigw01 (combined-llm-and-eventhub-policy.xml)
 
 ---
 
-## 部署決策圖（二選一）
+## 部署決策圖（三選一）
 
 ```
-                            ┌── 一般 chat、body < 256KB、無 streaming reasoning ──→ 方案 1
-中央稽核需求 ──→ 評估 body / streaming / 歸檔 ─┤
-                            └── 任一條件命中（>256KB / SSE / >90d 歸檔） ─────→ 方案 2 (always-on)
+                        ┌── 純歷史相容 / 既有 App Insights Workbook 鎖定 ──→ 方案 1A（legacy，不建議新部署）
+中央稽核需求 ─→ 評估 ───┤
+                        ├── ⭐ 預設首選：body ≤ 2 MB（含 streaming SSE）─→ 方案 1B（GatewayLlmLogs，零 policy code）
+                        │
+                        └── body > 2 MB / 需離開 LAW（直進 ADX/Synapse）/ 永久 Blob 歸檔 ─→ 方案 2 (always-on)
 
-方案 1 路徑:
-  Client ──→ APIM ──→ App Insights (LLMRequest/LLMResponse, ≤256KB)
-                                  └─→ KQL / Workbook / Alert
+方案 1A 路徑（legacy）:
+  Client ──→ APIM (applicationinsights diagnostic) ──→ App Insights dependencies (≤256KB, streaming 只首封包)
 
-方案 2 路徑（always-on，正式部署）:
+方案 1B 路徑（⭐ 建議）:
+  Client ──→ APIM (azuremonitor diagnostic, largeLanguageModel.logs=enabled)
+                ↓
+        Resource Log: GatewayLlmLogs ──→ LAW ApiManagementGatewayLlmLog table
+                                        （多筆 row：seq=0 metadata, seq=1 request, seq≥2 response chunks，2 MB cap）
+
+方案 2 路徑（always-on）:
   Client ──→ APIM (combined-llm-and-eventhub-policy-always-on.xml)
               ├─→ Backend (Foundry / OpenAI)
               └─→ Event Hub (aigw-llm-logs, MSI)
-                    └─→ Blob Capture (Avro, 60s/10MB)
-                          └─→ ADX external table / notebook reassemble by correlationId
+                    └─→ Blob Capture (Avro, 60s/10MB) ──→ ADX external table / notebook reassemble
 
-⚠️ 本 lab 為了同時驗證兩個方案，使用 header-keyed 版讓兩條路在同一個 APIM 並存；
-   正式部署不會這樣做——選定其中一個方案套用即可。
+⚠️ 本 lab 為了同時驗證所有方案，方案 2 policy 用 header-keyed 版讓多條路並存；
+   正式部署選定其中一個套用即可（方案 1B 預設首選）。
 ```
 
 ---
 
 ## 如何選擇
 
-回答以下任一題若是 **YES**，請選方案 2；全部 NO，方案 1 即可。
+回答以下流程：
 
-| 問題 | YES → 方案 2 的理由 |
-|---|---|
-| 是否會出現 prompt + completion 任一邊 > 256KB（含長文件分析、長 context window）？ | 方案 1 會被截斷 |
-| 是否使用 reasoning model（Kimi-K2.5、o1/o3、DeepSeek-R1）或大量 streaming（SSE）？ | 方案 1 只能拿到首封包 |
-| 是否需要將完整對話歸檔 > 90 天（合規 / 法務）？ | App Insights 預設 90 天 retention |
-| 是否需要把對話送進 ADX / Synapse 做大規模分析、向量化、或 fine-tune 資料集？ | Blob Capture 的 Avro 直接可被 ADX external table / Synapse Serverless 查 |
+1. **絕大多數情境（>95%）→ 方案 1B**：原生 chunk + SequenceNumber、原生 streaming SSE 重組、2 MB 上限、零 policy code。V1 實測對 Kimi-K2.5 streaming 也能拿到完整 reasoning content。
+2. **以下任一條件成立 → 改走方案 2**：
 
-> 計費聚合 / 容量規劃需求另從 Foundry 內建 `AzureMetrics`（**免費**，與兩個方案皆不衝突）取得。
+   | 條件 | 方案 2 的理由 |
+   |---|---|
+   | 單條 prompt 或 completion 可能 > 2 MB | GatewayLlmLogs 硬上限是 2 MB；方案 2 只受 EH Standard 1 MB / message 限制，可任意 chunk |
+   | 不能把對話內容寫進 LAW（合規 / 隔離 / 多租戶資料分離） | 方案 2 直接寫 EH → Blob，可選 customer-managed key、private endpoint，不經 LAW |
+   | 需要 > 730 天的永久歸檔 | LAW 最大 retention 730 天；Blob 可永久（含 archive tier） |
+   | 需要把對話直接餵 ADX / Synapse / Spark 做大規模分析、向量化、fine-tune 資料集 | Avro on Blob 是 ADX external table / Synapse Serverless 原生支援格式 |
+
+3. **方案 1A 何時還用？** 只在「現有 App Insights Workbook / Alert 已鎖定 `dependencies` 表 schema 且短期不能改」的維護情境。新部署不要選。
+
+> 計費聚合 / 容量規劃需求另從 Foundry 內建 `AzureMetrics`（**免費**，與三個方案皆不衝突）取得。
 
 ---
 
@@ -377,4 +488,6 @@ APIM testaigw01 (combined-llm-and-eventhub-policy.xml)
 | `9d28994` | verify 處理 APIM `<retry>` 多 attempt 場景 |
 | `f090159` | 加入 SOLUTIONS.md（方案總覽） |
 | `f458c9b` | 加入 always-on policy 變體 + 客戶部署選項章節 |
-| _(本次)_ | 改寫為「二選一」框架（中央稽核情境下不雙軌並行） |
+| `e59bab7` | 改寫為「二選一」框架 |
+| `67450bb` | R1 根因修正（LAW dynamic 欄位上限） |
+| _(本次)_ | **新增方案 1B（GatewayLlmLogs）** + V1 streaming SSE 實測結果，框架改為三選一 |
