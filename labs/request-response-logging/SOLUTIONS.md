@@ -193,9 +193,22 @@ ApiManagementGatewayLlmLog
 | **G4** | Retry 行為 | APIM `<retry>` 每個 attempt 產一組獨立 CorrelationId（V1 觀察到 V1A 一筆失敗的 8a73 與 V1A2 成功的 75f8 是不同 CorrelationId） |
 | **G5** | API-level diagnostic 必須**額外**設 `azuremonitor` 一份 | 跟現有 `applicationinsights` diagnostic 共存（不衝突）。若客戶選定 1B，可移除 `applicationinsights` diagnostic 與 logger 以省 App Insights 成本 |
 
+### 端到端驗證 notebook
+
+`notebooks/test-solution-1b-llmlogs.ipynb` — 自動化驗證 4 個 TC：
+
+| TC | 場景 | KQL 驗證重點 |
+|---|---|---|
+| TC-1B-1 | 短 non-streaming | 1 個 CorrelationId、3 筆 row、isStream=false、completion 內容非空 |
+| TC-1B-2 | 大 non-streaming（>3500 token 中文長文） | response 被切成 ≥2 個 seq≥2 chunk、重組後長度合理 |
+| TC-1B-3 | streaming SSE（Kimi-K2.5 reasoning） | **isStream=true 且 response 被 logger 自動重組為乾淨 assistant message**（1A 在這裡只能拿到 ~200 bytes） |
+| TC-1B-4 | 對照組（marker 不存在） | KQL 應拿到 not found，證明驗證腳本不會誤報 |
+
+每個 TC 後面跟一個 `verify_marker_1b()` cell，會輪詢 LAW、用 KQL 撈出 marker 對應的所有 row、檢查 SequenceNumber 連續性、重組 request + response、印出完整性報告。
+
 ---
 
-## 方案 2 — APIM `log-to-eventhub` → Event Hub → Blob Capture (Avro)
+## 方案 2— APIM `log-to-eventhub` → Event Hub → Blob Capture (Avro)
 
 ### 機制
 
